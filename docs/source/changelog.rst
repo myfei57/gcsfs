@@ -7,6 +7,21 @@ releasing in step with fsspec.
 Unreleased
 ----------
 
+* Added ``InventoryReport.iter_snapshot()``, an async streaming entry point
+  for inventory reports. It pins one report batch through its manifest
+  (validating shard completeness, report-time consistency and schema
+  fields, and pinning every shard generation) and yields object records
+  incrementally without downloading all shards as strings. CSV is parsed by
+  a stateful incremental tokenizer that handles quoted delimiters, embedded
+  newlines, escaped quotes, UTF-8 sequences split across chunks and
+  configurable record separators; gzip shards are decompressed incrementally
+  under decompressed-byte and single-record size limits. Missing shards,
+  mixed report times or schema drift fail explicitly instead of presenting a
+  partial snapshot, parse errors carry the shard name and record position,
+  and optional missing-metadata HEAD requests are concurrency limited rather
+  than issued unconditionally. Early consumer exit or cancellation closes the
+  open response, decompressor and producer task, and a partial snapshot is
+  never published to the directory cache.
 * ``sign()`` now works with credentials that have no private key, such as
   Compute Engine and GKE Workload Identity credentials. When the credentials
   cannot sign, the URL is signed through the IAM Credentials ``signBlob`` API
