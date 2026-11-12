@@ -2335,17 +2335,162 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         if check_consistency:
             checker.validate_json_response(details)
 
+    async def _get_file_crc32c_parallel(
+        self,
+        rpath,
+        lpath,
+        *,
+        concurrency,
+        chunk_size,
+        max_pending_writes=None,
+        details=None,
+        headers=None,
+        callback=None,
+        **kwargs,
+    ):
+        """Parallel range download validated by polynomial CRC32C combination.
+
+        Metadata (object size, generation and whole-object crc32c) is fixed
+        up front. Every range request reads the pinned generation, each chunk
+        is checksummed locally on the bytes actually received, and the chunk
+        CRCs are combined without re-reading or reassembling the data. The
+        final target is only published after full coverage and a matching
+        whole-object checksum; a pre-existing target is left untouched on any
+        failure.
+        """
+        from .parallel_download import (
+            ParallelCrc32cDownloader,
+            validate_crc32c_download_details,
+        )
+
+        if details is None:
+            details = await self._info(rpath, **kwargs)
+        expected_crc32c, generation = validate_crc32c_download_details(details)
+        total_size = int(details.get("size", 0))
+
+        concurrency = max(1, min(int(concurrency), ParallelCrc32cDownloader.MAX_TASKS))
+        if max_pending_writes is None:
+            max_pending_writes = concurrency
+        max_pending_writes = max(1, min(int(max_pending_writes), concurrency))
+        ranges = split_range(total_size, concurrency, max(1, int(chunk_size)))
+
+        callback = callback or NoOpCallback()
+
+        lparent = os.path.dirname(lpath) or os.curdir
+        os.makedirs(lparent, exist_ok=True)
+        temp_path = os.path.join(
+            lparent,
+            f".{os.path.basename(lpath)}.crc32c.{uuid.uuid4().hex}.tmp",
+        )
+        # Write into a pre-allocated temporary file so the final target only
+        # appears after the atomic replace below.
+        self._init_local_file(temp_path, total_size)
+
+        fd = None
+
+        def write_chunk(offset, chunk):
+            if fd is not None:
+                written = 0
+                chunk_view = memoryview(chunk)
+                while written < len(chunk):
+                    written += os.pwrite(fd, chunk_view[written:], offset + written)
+            else:
+                # Thread-safe fallback for older Windows versions (Python < 3.12)
+                with open(temp_path, "rb+") as f:
+                    f.seek(offset)
+                    f.write(chunk)
+
+        def commit():
+            nonlocal fd
+            if fd is not None:
+                os.close(fd)
+                fd = None
+            os.replace(temp_path, lpath)
+
+        def abort():
+            nonlocal fd
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+                fd = None
+            with contextlib.suppress(OSError):
+                os.remove(temp_path)
+
+        async def fetch_range(start, end, pinned_generation):
+            # The generation is part of the URL, so every range request is
+            # served by the exact object version the metadata was read from.
+            range_url = self.url(rpath, generation=pinned_generation)
+            range_headers = {"Range": await self._process_limits(rpath, start, end)}
+            if headers:
+                range_headers.update(headers)
+            response_headers, data = await self._call(
+                "GET",
+                range_url,
+                headers=range_headers,
+                cache_type=kwargs.get("cache_type"),
+                cache_source=kwargs.get("cache_source"),
+            )
+            # GCS may echo the served generation; reject a changed generation
+            # explicitly when the header is available.
+            served_generation = (
+                response_headers.get("X-Goog-Generation") if response_headers else None
+            )
+            if served_generation and str(served_generation) != str(pinned_generation):
+                raise GenerationMismatchError(rpath, pinned_generation)
+            # The X-Goog-Hash whole-object checksum must not be used as the
+            # chunk checksum; only the returned bytes leave this function.
+            return data
+
+        try:
+            if hasattr(os, "pwrite"):
+                fd = os.open(temp_path, os.O_WRONLY | getattr(os, "O_BINARY", 0))
+
+            downloader = ParallelCrc32cDownloader(
+                fetcher=fetch_range,
+                writer=write_chunk,
+                commit=commit,
+                abort=abort,
+                ranges=ranges,
+                total_size=total_size,
+                generation=generation,
+                expected_crc32c=expected_crc32c,
+                concurrency=concurrency,
+                max_pending_writes=max_pending_writes,
+                callback=callback,
+            )
+            await downloader.run()
+        except BaseException:
+            abort()
+            raise
+
     async def _get_file(self, rpath, lpath, callback=None, **kwargs):
         if os.path.isdir(lpath):
             return
 
         callback = callback or NoOpCallback()
 
+        crc32c_parallel = kwargs.pop("crc32c_parallel", False)
         concurrency = kwargs.pop("concurrency", DEFAULT_CONCURRENCY)
         chunk_size = kwargs.pop("chunk_size", 16 * 1024 * 1024)
         max_prefetch_size = kwargs.pop(
             "max_prefetch_size", 2 * concurrency * chunk_size
         )
+        max_pending_writes = kwargs.pop("max_pending_writes", None)
+
+        if crc32c_parallel:
+            # This path manages its own temporary file and atomic publish; a
+            # failed validation must leave any pre-existing lpath untouched, so
+            # it deliberately bypasses the remove-on-error block below.
+            await self._get_file_crc32c_parallel(
+                rpath,
+                lpath,
+                callback=callback,
+                concurrency=concurrency,
+                chunk_size=chunk_size,
+                max_pending_writes=max_pending_writes,
+                **kwargs,
+            )
+            return
 
         try:
             # The concurrent path uses `_cat_file` to interact with gcsfs which doesn't take headers as argument.
