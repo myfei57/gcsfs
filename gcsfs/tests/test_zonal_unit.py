@@ -1444,6 +1444,37 @@ async def test_merge_delegates_to_core_for_non_zonal(async_gcs):
         mock_core_merge.assert_awaited_once_with(path, paths, acl="public-read")
 
 
+@pytest.mark.asyncio
+async def test_compose_many_zonal_not_supported(async_gcs, zonal_write_mocks):
+    """Test _compose_many for Zonal buckets raises NotImplementedError."""
+    path = f"{TEST_ZONAL_BUCKET}/merged_file"
+    paths = [f"{TEST_ZONAL_BUCKET}/file1", f"{TEST_ZONAL_BUCKET}/file2"]
+
+    with pytest.raises(
+        NotImplementedError,
+        match="Server-side compose/merge is not supported for Zonal buckets.",
+    ):
+        await async_gcs._compose_many(path, paths)
+
+
+@pytest.mark.asyncio
+async def test_compose_many_delegates_to_core_for_non_zonal(async_gcs):
+    """Test _compose_many delegates to core when the bucket is not zonal."""
+    path = f"{TEST_BUCKET}/merged_file"
+    paths = [f"{TEST_BUCKET}/file1", f"{TEST_BUCKET}/file2"]
+
+    with (
+        mock.patch.object(async_gcs, "_is_zonal_bucket", return_value=False),
+        mock.patch(
+            "gcsfs.core.GCSFileSystem._compose_many", new_callable=mock.AsyncMock
+        ) as mock_core_compose,
+    ):
+        await async_gcs._compose_many(path, paths, concurrency=4, plan_only=True)
+        mock_core_compose.assert_awaited_once_with(
+            path, paths, concurrency=4, plan_only=True
+        )
+
+
 @pytest.mark.parametrize(
     "requester_pays, expected_quota_project",
     [

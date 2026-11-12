@@ -2773,6 +2773,21 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
 
         return await super()._merge(path, paths, acl=acl)
 
+    async def _compose_many(self, path, paths, **kwargs):
+        """Layered compose within a single bucket.
+
+        Standard GCS buckets delegate to the core implementation; Zonal
+        buckets do not support server-side compose.
+        """
+        bucket, _, _ = self.split_path(path)
+
+        if await self._is_zonal_bucket(bucket):
+            raise NotImplementedError(
+                "Server-side compose/merge is not supported for Zonal buckets."
+            )
+
+        return await super()._compose_many(path, paths, **kwargs)
+
 
 # Wrap ExtendedGcsFileSystem's own sync/async overrides (e.g. `mv`, `rm`, `_cat_file`, `_find`)
 # so they propagate caller framework telemetry; inherited GCSFileSystem methods are already wrapped.

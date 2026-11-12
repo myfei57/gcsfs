@@ -3,6 +3,7 @@ Google Cloud Storage pythonic interface
 """
 
 import asyncio
+import base64
 import contextlib
 import io
 import json
@@ -18,6 +19,7 @@ import threading
 import uuid
 import warnings
 import weakref
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from glob import has_magic
 from urllib.parse import parse_qs
@@ -38,6 +40,7 @@ from .concurrency import parallel_tasks_first_completed, split_range
 from .credentials import GoogleCredentials
 from .inventory_report import InventoryReport
 from .retry import (
+    ChecksumError,
     GenerationMismatchError,
     HttpError,
     errs,
@@ -103,6 +106,15 @@ _VALID_LIST_PARAMS = {
     "pageToken",
     "includeFoldersAsPrefixes",
 }
+
+# Hard server-side limits for the JSON API objects.compose operation.
+# See https://cloud.google.com/storage/docs/composite-objects
+GCS_COMPOSE_MAX_SOURCE_OBJECTS = 32
+GCS_MAX_OBJECT_SIZE = 5 * 2**40  # 5 TiB, including composite objects
+DEFAULT_COMPOSE_MANY_CONCURRENCY = 8
+DEFAULT_COMPOSE_MANY_TEMP_PREFIX = "_gcsfs/compose_many/"
+# CRC32C reflected polynomial (Castagnoli), used to combine component CRCs.
+_CRC32C_POLY = 0x82F63B78
 
 
 def quote(s):
@@ -301,6 +313,230 @@ def _build_user_agent(cache_type=None, cache_source=None):
     return " ".join(tokens)
 
 
+# ---------------------------------------------------------------------------
+# Layered compose (``compose_many``) support
+#
+# A GCS compose request accepts between 1 and 32 source objects. To combine
+# arbitrarily many sources, inputs are pinned to exact generations and merged
+# through a tree of at-most-32-source compose steps, whose intermediate
+# results are unique temporary objects. Every request carries generation
+# preconditions, and cleanup only ever deletes exact object versions this
+# operation is known to have created.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ComposeSource:
+    """One ordered, generation-pinned compose input object."""
+
+    path: str
+    bucket: str
+    name: str
+    generation: str
+    size: int
+    crc32c: str | None
+    storage_class: str | None
+
+
+@dataclass(frozen=True)
+class ComposeObjectRef:
+    """Reference to one input of a compose step.
+
+    ``kind="leaf"`` points at ``ComposePlan.sources[index]``; ``kind="temp"``
+    points at the intermediate object created by layer ``layer`` step
+    ``index``.
+    """
+
+    kind: str
+    index: int
+    layer: int = -1
+
+
+@dataclass(frozen=True)
+class ComposeStep:
+    """One compose HTTP request within the layered plan."""
+
+    layer: int
+    index: int
+    destination_name: str
+    is_final: bool
+    refs: tuple[ComposeObjectRef, ...]
+    # Destination precondition. 0 for every temp (create-only); None on the
+    # final step means the live destination generation is resolved at run time.
+    if_generation_match: int | None
+
+
+@dataclass(frozen=True)
+class ComposePlan:
+    operation_id: str
+    bucket: str
+    destination_name: str
+    temp_prefix: str
+    sources: tuple[ComposeSource, ...]
+    layers: tuple[tuple[ComposeStep, ...], ...]
+    total_size: int
+    max_sources_per_compose: int
+
+
+@dataclass(frozen=True)
+class ComposeTemp:
+    """An intermediate object this operation created, with its exact generation."""
+
+    bucket: str
+    name: str
+    generation: str
+    layer: int
+    index: int
+    size: int
+    crc32c: str | None
+
+
+@dataclass
+class ComposeManyResult:
+    """Outcome of a ``compose_many`` operation, including its cleanup ledger."""
+
+    plan: ComposePlan
+    success: bool = False
+    destination_generation: str | None = None
+    destination_size: int | None = None
+    destination_crc32c: str | None = None
+    created_temps: list[ComposeTemp] = field(default_factory=list)
+    deleted_temps: list[ComposeTemp] = field(default_factory=list)
+    # (temp object, error message) pairs the best-effort cleanup could not remove.
+    uncleaned: list[tuple[ComposeTemp, str]] = field(default_factory=list)
+
+
+def _gf2_matrix_times(mat, vec):
+    summary = 0
+    i = 0
+    while vec:
+        if vec & 1:
+            summary ^= mat[i]
+        vec >>= 1
+        i += 1
+    return summary
+
+
+def _gf2_matrix_square(square, mat):
+    for n in range(32):
+        square[n] = _gf2_matrix_times(mat, mat[n])
+
+
+def _crc32c_combine(crc1, crc2, len2):
+    """Return ``crc32c(a + b)`` from ``crc32c(a)``, ``crc32c(b)`` and ``len(b)``.
+
+    Uses the same GF(2) operator approach as zlib's ``crc32_combine``,
+    parameterised with the CRC32C (Castagnoli) reflected polynomial. The
+    integer digest values are exactly those GCS returns in object metadata,
+    so component CRCs can be combined without downloading any bytes.
+    """
+    if len2 == 0:
+        return crc1
+    odd = [0] * 32
+    even = [0] * 32
+    odd[0] = _CRC32C_POLY
+    row = 1
+    for n in range(1, 32):
+        odd[n] = row
+        row <<= 1
+    _gf2_matrix_square(even, odd)
+    _gf2_matrix_square(odd, even)
+    while True:
+        _gf2_matrix_square(even, odd)
+        if len2 & 1:
+            crc1 = _gf2_matrix_times(even, crc1)
+        len2 >>= 1
+        if len2 == 0:
+            break
+        _gf2_matrix_square(odd, even)
+        if len2 & 1:
+            crc1 = _gf2_matrix_times(odd, crc1)
+        len2 >>= 1
+        if len2 == 0:
+            break
+    return crc1 ^ crc2
+
+
+def _crc32c_from_b64(value):
+    return int.from_bytes(base64.b64decode(value), "big")
+
+
+def _crc32c_to_b64(value):
+    return base64.b64encode(value.to_bytes(4, "big")).decode()
+
+
+def build_compose_plan(
+    sources,
+    bucket,
+    destination_name,
+    temp_prefix,
+    max_sources_per_compose,
+    operation_id,
+    destination_if_generation_match=None,
+):
+    """Build the layered compose plan for ordered, already-pinned sources.
+
+    Each layer groups its inputs into chunks of at most
+    ``max_sources_per_compose`` (never more than the GCS limit of 32) and
+    emits one compose step per chunk. Intermediate layers write to unique
+    temporary objects; the single step of the last layer writes to the
+    destination.
+    """
+    n = len(sources)
+    if n == 0:
+        raise ValueError("compose_many requires at least one source object")
+    if not 1 <= max_sources_per_compose <= GCS_COMPOSE_MAX_SOURCE_OBJECTS:
+        raise ValueError(
+            "max_sources_per_compose must be between 1 and "
+            f"{GCS_COMPOSE_MAX_SOURCE_OBJECTS}, got {max_sources_per_compose}"
+        )
+
+    layers = []
+    current = [ComposeObjectRef("leaf", i) for i in range(n)]
+    layer_no = 0
+    while True:
+        groups = [
+            current[i : i + max_sources_per_compose]
+            for i in range(0, len(current), max_sources_per_compose)
+        ]
+        if len(groups) == 1:
+            # The only remaining group becomes the destination directly; no
+            # extra single-input compose layer is introduced.
+            layers.append(
+                (
+                    ComposeStep(
+                        layer_no,
+                        0,
+                        destination_name,
+                        True,
+                        tuple(groups[0]),
+                        destination_if_generation_match,
+                    ),
+                )
+            )
+            break
+        steps = []
+        next_refs = []
+        for idx, group in enumerate(groups):
+            temp_name = f"{temp_prefix}{operation_id}/layer{layer_no}/part{idx}"
+            steps.append(ComposeStep(layer_no, idx, temp_name, False, tuple(group), 0))
+            next_refs.append(ComposeObjectRef("temp", idx, layer_no))
+        layers.append(tuple(steps))
+        current = next_refs
+        layer_no += 1
+
+    return ComposePlan(
+        operation_id=operation_id,
+        bucket=bucket,
+        destination_name=destination_name,
+        temp_prefix=temp_prefix,
+        sources=tuple(sources),
+        layers=tuple(layers),
+        total_size=sum(s.size for s in sources),
+        max_sources_per_compose=max_sources_per_compose,
+    )
+
+
 class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
     r"""
     Connect to Google Cloud Storage.
@@ -438,6 +674,9 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
     protocol = "gs", "gcs"
     async_impl = True
     MIN_CHUNK_SIZE_FOR_CONCURRENCY = 5 * 1024 * 1024
+    # Defaults for compose_many(); overridable per call or on an instance.
+    compose_many_concurrency = DEFAULT_COMPOSE_MANY_CONCURRENCY
+    compose_many_temp_prefix = DEFAULT_COMPOSE_MANY_TEMP_PREFIX
 
     def __init__(
         self,
@@ -1501,6 +1740,12 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
 
     async def _merge(self, path, paths, acl=None):
         """Concatenate objects within a single bucket"""
+        if len(paths) > GCS_COMPOSE_MAX_SOURCE_OBJECTS:
+            raise ValueError(
+                f"merge accepts at most {GCS_COMPOSE_MAX_SOURCE_OBJECTS} source "
+                f"objects per request, got {len(paths)}; use compose_many() for "
+                "layered composition of arbitrarily many sources"
+            )
         bucket, key, generation = self.split_path(path)
         source = [{"name": self.split_path(p)[1]} for p in paths]
         await self._call(
@@ -1518,6 +1763,407 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         )
 
     merge = asyn.sync_wrapper(_merge)
+
+    async def _resolve_compose_source(self, source_path, bucket):
+        """Fetch fresh metadata and pin one input to its exact generation.
+
+        Paths are always parsed version-aware, so a bucket or generation
+        carried in the input path is honoured (or rejected) rather than
+        silently dropped.
+        """
+        source_bucket, name, pinned_generation = self._split_path(
+            source_path, version_aware=True
+        )
+        if source_bucket != bucket:
+            raise ValueError(
+                f"compose source {source_path!r} lives in bucket "
+                f"{source_bucket!r}, but compose requires every object to be in "
+                f"the destination bucket {bucket!r}"
+            )
+        if not name:
+            raise ValueError(f"compose source {source_path!r} does not name an object")
+        info = await self._call(
+            "GET",
+            "b/{}/o/{}",
+            source_bucket,
+            name,
+            json_out=True,
+            generation=pinned_generation,
+        )
+        generation = str(info["generation"])
+        if pinned_generation is not None and str(pinned_generation) != generation:
+            raise ValueError(
+                f"compose source {source_path!r} pinned generation "
+                f"{pinned_generation} but the service returned {generation}"
+            )
+        return ComposeSource(
+            path=source_path,
+            bucket=source_bucket,
+            name=name,
+            generation=generation,
+            size=int(info.get("size", 0)),
+            crc32c=info.get("crc32c"),
+            storage_class=info.get("storageClass"),
+        )
+
+    async def _resolve_destination_condition(self, bucket, name):
+        """Explicit destination precondition: 0 when absent, else live generation."""
+        try:
+            info = await self._call("GET", "b/{}/o/{}", bucket, name, json_out=True)
+        except FileNotFoundError:
+            return 0
+        return int(info["generation"])
+
+    def _resolve_compose_concurrency(self, concurrency):
+        if concurrency is None:
+            concurrency = self.compose_many_concurrency
+        if isinstance(concurrency, bool) or not isinstance(concurrency, int):
+            raise ValueError(
+                f"concurrency must be a positive integer, got {concurrency!r}"
+            )
+        if concurrency < 1:
+            raise ValueError(
+                f"concurrency must be a positive integer, got {concurrency!r}"
+            )
+        return concurrency
+
+    @staticmethod
+    async def _run_bounded_coros(coros, concurrency):
+        """Run coros with bounded concurrency, closing any never-scheduled ones."""
+        try:
+            return await asyn._run_coros_in_chunks(coros, batch_size=concurrency)
+        except BaseException:
+            # A sibling failure can leave list entries that never became
+            # tasks; close them so they do not warn as un-awaited coroutines.
+            for coro in coros:
+                if coro.cr_frame is not None and not coro.cr_running:
+                    coro.close()
+            raise
+
+    async def _run_compose_step(
+        self, step, plan, temps, sources, result, state, acl, check_crc32c
+    ):
+        """Issue one compose request and validate the returned object resource."""
+        source_objects = []
+        expected_size = 0
+        expected_crc = None
+        for ref in step.refs:
+            if ref.kind == "leaf":
+                src = sources[ref.index]
+                name = src.name
+                generation = src.generation
+                size = src.size
+                crc32c = src.crc32c
+            else:
+                temp = temps[(ref.layer, ref.index)]
+                name = temp.name
+                generation = temp.generation
+                size = temp.size
+                crc32c = temp.crc32c
+            # Pin the exact generation and require it to still be live.
+            source_objects.append(
+                {
+                    "name": name,
+                    "generation": str(generation),
+                    "objectPreconditions": {"ifGenerationMatch": str(generation)},
+                }
+            )
+            expected_size += size
+            if check_crc32c and crc32c:
+                component_crc = _crc32c_from_b64(crc32c)
+                if expected_crc is None:
+                    expected_crc = component_crc
+                else:
+                    expected_crc = _crc32c_combine(expected_crc, component_crc, size)
+
+        if step.is_final and step.if_generation_match is None:
+            destination_match = await self._resolve_destination_condition(
+                plan.bucket, plan.destination_name
+            )
+        else:
+            destination_match = step.if_generation_match or 0
+
+        params = {"ifGenerationMatch": str(destination_match)}
+        if acl is not None:
+            params["destinationPredefinedAcl"] = acl
+        response = await self._call(
+            "POST",
+            "b/{}/o/{}/compose",
+            plan.bucket,
+            step.destination_name,
+            headers={"Content-Type": "application/json"},
+            json={
+                "kind": "storage#composeRequest",
+                "sourceObjects": source_objects,
+                "destination": {
+                    "name": step.destination_name,
+                    "bucket": plan.bucket,
+                },
+            },
+            json_out=True,
+            **params,
+        )
+        generation = str(response["generation"])
+        actual_size = int(response.get("size", -1))
+        if actual_size != expected_size:
+            raise ChecksumError(
+                f"compose response for {step.destination_name!r} reports size "
+                f"{actual_size}, expected {expected_size}"
+            )
+        actual_crc32c = response.get("crc32c")
+        if check_crc32c:
+            if not actual_crc32c:
+                raise ChecksumError(
+                    f"compose response for {step.destination_name!r} includes no "
+                    "crc32c to verify"
+                )
+            if _crc32c_from_b64(actual_crc32c) != expected_crc:
+                if step.is_final:
+                    # The destination must not stay published with bad data.
+                    state["published_destination"] = (
+                        plan.bucket,
+                        step.destination_name,
+                        generation,
+                    )
+                raise ChecksumError(
+                    f"crc32c mismatch for composed object "
+                    f"{step.destination_name!r}: service returned "
+                    f"{actual_crc32c}, expected {_crc32c_to_b64(expected_crc)}"
+                )
+
+        if step.is_final:
+            result.destination_generation = generation
+            result.destination_size = actual_size
+            result.destination_crc32c = actual_crc32c
+            return None
+
+        temp = ComposeTemp(
+            plan.bucket,
+            step.destination_name,
+            generation,
+            step.layer,
+            step.index,
+            actual_size,
+            actual_crc32c,
+        )
+        # Register immediately so failure/cancellation cleanup can only ever
+        # target versions this operation is known to have created.
+        temps[(step.layer, step.index)] = temp
+        result.created_temps.append(temp)
+        return temp
+
+    async def _cleanup_compose_temps(self, result, published_destination):
+        """Delete exact object versions this operation is known to have created.
+
+        This never lists or prefix-deletes: objects belonging to other
+        processes that happen to share the temp prefix are untouched. Delete
+        failures are collected on ``result.uncleaned`` for inspection instead
+        of being raised over the original operation error.
+        """
+        targets = list(result.created_temps)
+        if published_destination is not None:
+            bucket, name, generation = published_destination
+            targets.append(
+                ComposeTemp(bucket, name, generation, -1, -1, size=0, crc32c=None)
+            )
+        if not targets:
+            return
+
+        async def _delete_one(temp):
+            await self._call(
+                "DELETE",
+                "b/{}/o/{}",
+                temp.bucket,
+                temp.name,
+                generation=temp.generation,
+            )
+            return temp
+
+        outcomes = await asyn._run_coros_in_chunks(
+            [_delete_one(temp) for temp in targets],
+            batch_size=self.compose_many_concurrency,
+            return_exceptions=True,
+        )
+        for temp, outcome in zip(targets, outcomes):
+            if isinstance(outcome, Exception):
+                result.uncleaned.append((temp, str(outcome)))
+            else:
+                result.deleted_temps.append(temp)
+
+    async def _compose_many(
+        self,
+        path,
+        paths,
+        acl=None,
+        temp_prefix=None,
+        if_generation_match=None,
+        concurrency=None,
+        max_sources_per_compose=GCS_COMPOSE_MAX_SOURCE_OBJECTS,
+        plan_only=False,
+        check_crc32c=True,
+    ):
+        """Concatenate arbitrarily many generation-pinned objects in one bucket.
+
+        Sources are pinned to exact generations up front and combined through a
+        layered tree of compose requests, each carrying at most
+        ``max_sources_per_compose`` (hard-capped at the GCS limit of 32)
+        source objects. Intermediate results are unique temporary objects
+        created with ``ifGenerationMatch=0``; every source reference carries
+        its pinned generation plus an ``objectPreconditions.ifGenerationMatch``
+        condition, and the final destination uses an explicit generation
+        precondition, so a conflicting replacement is never overwritten.
+
+        Parameters
+        ----------
+        path : str
+            Destination object in ``bucket/key`` form. A generation on the
+            path is rejected.
+        paths : list[str]
+            Ordered source object paths. Duplicate paths are kept as
+            duplicate inputs (their bytes appear repeatedly). A generation
+            carried in a path (fragment or ``?generation=``) pins that exact
+            version, regardless of ``version_aware``; sources in another
+            bucket are rejected rather than silently re-bucketed.
+        acl : str, optional
+            Destination predefined ACL applied to every compose request.
+        temp_prefix : str, optional
+            Prefix for intermediate objects; defaults to
+            ``compose_many_temp_prefix`` on the instance.
+        if_generation_match : int, optional
+            Explicit destination precondition. When omitted, the live
+            destination generation is resolved at execution time (0 if the
+            object does not yet exist).
+        concurrency : int, optional
+            Maximum number of in-flight metadata, compose and cleanup
+            requests. Defaults to ``compose_many_concurrency``.
+        max_sources_per_compose : int
+            Source-object cap per compose request; must be within 1..32.
+        plan_only : bool
+            When True, resolve and pin every source and return the
+            :class:`ComposePlan` without issuing any compose or delete request.
+        check_crc32c : bool
+            Verify each returned composite CRC32C against the CRC32C values
+            combined from the service-returned component metadata. Composite
+            objects have no MD5 and none is required.
+
+        Returns
+        -------
+        ComposePlan or ComposeManyResult
+            The plan in plan-only mode, otherwise a result carrying the
+            destination generation and the create/delete cleanup ledger,
+            including any ``uncleaned`` temp versions.
+        """
+        bucket, key, dest_generation = self._split_path(path, version_aware=True)
+        if not key:
+            raise ValueError("compose_many destination must name an object")
+        if dest_generation is not None:
+            raise ValueError("Cannot compose into a specific object generation")
+        if not paths:
+            raise ValueError("compose_many requires at least one source object")
+
+        if if_generation_match is not None:
+            if isinstance(if_generation_match, bool) or int(if_generation_match) < 0:
+                raise ValueError(
+                    "if_generation_match must be a non-negative integer, got "
+                    f"{if_generation_match!r}"
+                )
+            if_generation_match = int(if_generation_match)
+
+        concurrency = self._resolve_compose_concurrency(concurrency)
+        if temp_prefix is None:
+            temp_prefix = self.compose_many_temp_prefix
+        if not temp_prefix.endswith("/"):
+            temp_prefix += "/"
+
+        # Pin every source generation up front; order (including duplicates)
+        # is preserved by _run_coros_in_chunks.
+        sources = await self._run_bounded_coros(
+            [
+                self._resolve_compose_source(source_path, bucket)
+                for source_path in paths
+            ],
+            concurrency,
+        )
+
+        empty_sources = [s.path for s in sources if s.size == 0]
+        if empty_sources:
+            raise ValueError(
+                "GCS compose cannot include 0-byte source objects; empty "
+                "sources: " + ", ".join(empty_sources)
+            )
+        total_size = sum(s.size for s in sources)
+        if total_size > GCS_MAX_OBJECT_SIZE:
+            raise ValueError(
+                f"composed object would be {total_size} bytes, exceeding the "
+                f"GCS maximum object size of {GCS_MAX_OBJECT_SIZE} bytes (5 TiB)"
+            )
+        storage_classes = {s.storage_class for s in sources if s.storage_class}
+        if len(storage_classes) > 1:
+            raise ValueError(
+                "all compose sources must share one storage class, found: "
+                + ", ".join(sorted(storage_classes))
+            )
+        if check_crc32c:
+            missing_crc = [s.path for s in sources if not s.crc32c]
+            if missing_crc:
+                raise ChecksumError(
+                    "cannot verify CRC32C: the service returned no crc32c for: "
+                    + ", ".join(missing_crc)
+                )
+
+        operation_id = uuid.uuid4().hex
+        plan = build_compose_plan(
+            sources,
+            bucket,
+            key,
+            temp_prefix,
+            max_sources_per_compose,
+            operation_id,
+            destination_if_generation_match=if_generation_match,
+        )
+        if plan_only:
+            return plan
+
+        result = ComposeManyResult(plan=plan)
+        # (layer, index) -> ComposeTemp for inputs of subsequent layers.
+        temps = {}
+        state = {"published_destination": None}
+        try:
+            for layer in plan.layers:
+                await self._run_bounded_coros(
+                    [
+                        self._run_compose_step(
+                            step,
+                            plan,
+                            temps,
+                            sources,
+                            result,
+                            state,
+                            acl,
+                            check_crc32c,
+                        )
+                        for step in layer
+                    ],
+                    concurrency,
+                )
+            result.success = True
+        except BaseException as exc:
+            # A failure (or cancellation) at any layer must not leave the
+            # destination published or this operation's temps behind.
+            await self._cleanup_compose_temps(result, state["published_destination"])
+            try:
+                exc.compose_many_result = result
+            except AttributeError:
+                # Some exception types (e.g. __slots__ subclasses) cannot carry
+                # the ledger; cleanup has already run best-effort.
+                pass
+            raise
+        else:
+            await self._cleanup_compose_temps(result, None)
+            await self._write_file_cache_update(path)
+        return result
+
+    compose_many = asyn.sync_wrapper(_compose_many)
 
     # TODO: Add async mv method in the async.py and remove from GCSFileSystem.
     async def _mv(
