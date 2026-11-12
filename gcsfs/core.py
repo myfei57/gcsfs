@@ -18,8 +18,11 @@ import threading
 import uuid
 import warnings
 import weakref
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from glob import has_magic
+from types import MappingProxyType
+from typing import Mapping, Optional
 from urllib.parse import parse_qs
 from urllib.parse import quote as quote_urllib
 from urllib.parse import urlsplit
@@ -38,8 +41,12 @@ from .concurrency import parallel_tasks_first_completed, split_range
 from .credentials import GoogleCredentials
 from .inventory_report import InventoryReport
 from .retry import (
+    ChecksumError,
     GenerationMismatchError,
     HttpError,
+    MetadataUpdateOutcomeUnknown,
+    MetagenerationMismatchError,
+    ObjectReplaced,
     errs,
     retry_request,
     validate_response,
@@ -1498,6 +1505,332 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         return o_json.get("metadata", {})
 
     setxattrs = asyn.sync_wrapper(_setxattrs)
+
+    async def _fetch_object_resource(self, path, generation=None):
+        """Fetch the raw object resource through ``objects.get`` without cache.
+
+        Mirrors the permission fallback of :meth:`_get_object` but never
+        consults ``dircache``, so optimistic metadata updates always build
+        their preconditions from the current generation/metageneration rather
+        than stale cached state.
+        """
+        bucket, key, path_generation = self.split_path(path)
+        generation = _coalesce_generation(generation, path_generation)
+
+        try:
+            return await self._call(
+                "GET",
+                "b/{}/o/{}",
+                bucket,
+                key,
+                json_out=True,
+                generation=generation,
+            )
+        except OSError as e:
+            if not str(e).startswith("Forbidden"):
+                raise
+            resp = await self._call(
+                "GET",
+                "b/{}/o",
+                bucket,
+                json_out=True,
+                prefix=key,
+                maxResults=1 if not generation else None,
+                versions="true" if generation else None,
+            )
+            for item in resp.get("items", []):
+                if item["name"] == key and (
+                    not generation or item.get("generation") == generation
+                ):
+                    return item
+            raise FileNotFoundError(path)
+
+    def _store_metadata_result(self, path, resource):
+        """Process a deterministically returned resource and refresh dircache.
+
+        Only resources actually returned by GCS (a PATCH response, a verified
+        post-loss GET or the no-op snapshot GET) are cached; guessed or
+        unverified state is never written.
+        """
+        bucket, _, _ = self.split_path(path)
+        processed = self._process_object(bucket, resource)
+        parent = self._parent(processed["name"])
+        if parent in self.dircache:
+            name = processed["name"]
+            self.dircache[parent] = [
+                entry
+                for entry in self.dircache[parent]
+                if entry.get("name") != name
+            ] + [processed]
+        return processed
+
+    async def _handle_metadata_conflict(
+        self, path, snapshot, attempts, max_attempts, pinned_generation, exc
+    ):
+        """Classify a 412 on the metadata PATCH and return a resource to retry.
+
+        A fresh live resource is read before any retry so the transform is
+        re-invoked on the new state; the previously computed patch is never
+        replayed onto it. Raises :class:`ObjectReplaced` when the object
+        generation changed and :class:`MetagenerationMismatchError` when the
+        attempt budget is spent on same-generation metadata races.
+        """
+        try:
+            live = await self._fetch_object_resource(path, None)
+        except FileNotFoundError:
+            self.invalidate_cache(path)
+            if pinned_generation is not None:
+                raise ObjectReplaced(path, snapshot.generation, None) from exc
+            raise
+
+        live_generation = live.get("generation")
+        if live_generation != snapshot.generation:
+            # A same-name object was overwritten/recreated. Metageneration may
+            # coincidentally match, so generation is the only identity check.
+            self.invalidate_cache(path)
+            raise ObjectReplaced(
+                path, snapshot.generation, live_generation
+            ) from exc
+
+        if attempts >= max_attempts:
+            self.invalidate_cache(path)
+            raise MetagenerationMismatchError(
+                path, live.get("metageneration"), attempts
+            ) from exc
+
+        # Same object, metadata-only concurrent change: retry on the new state.
+        return live
+
+    async def _resolve_lost_metadata_response(
+        self, path, bucket, key, snapshot, body, exc
+    ):
+        """Recover from a PATCH whose response was lost, without re-running
+        the (potentially non-idempotent) transform.
+
+        A verification GET distinguishes a provably committed update (all
+        intended changes present) from a provably uncommitted one
+        (metageneration unchanged, in which case the *same* conditional body
+        is sent once more). Anything else raises
+        :class:`MetadataUpdateOutcomeUnknown` for out-of-band verification.
+        """
+        try:
+            live = await self._fetch_object_resource(path, None)
+        except FileNotFoundError:
+            self.invalidate_cache(path)
+            raise MetadataUpdateOutcomeUnknown(
+                path, snapshot.generation, snapshot.metageneration, body, exc
+            ) from exc
+
+        if live.get("generation") != snapshot.generation:
+            self.invalidate_cache(path)
+            raise MetadataUpdateOutcomeUnknown(
+                path, snapshot.generation, snapshot.metageneration, body, exc
+            ) from exc
+
+        if live.get("metageneration") == snapshot.metageneration:
+            # No metadata change landed since the snapshot, so the lost PATCH
+            # demonstrably did not commit. The original preconditions are
+            # still valid; re-send the identical conditional body once.
+            try:
+                response = await self._call(
+                    "PATCH",
+                    "b/{}/o/{}",
+                    bucket,
+                    key,
+                    json=body,
+                    json_out=True,
+                    ifGenerationMatch=snapshot.generation,
+                    ifMetagenerationMatch=snapshot.metageneration,
+                )
+            except _METADATA_PATCH_RESEND_ERRORS as exc2:
+                self.invalidate_cache(path)
+                raise MetadataUpdateOutcomeUnknown(
+                    path, snapshot.generation, snapshot.metageneration, body, exc
+                ) from exc2
+            return self._store_metadata_result(path, response)
+
+        if _metadata_patch_reflected(live, body):
+            # The metageneration advanced and every intended change is in
+            # place, so the lost PATCH was accepted by the server.
+            return self._store_metadata_result(path, live)
+
+        self.invalidate_cache(path)
+        raise MetadataUpdateOutcomeUnknown(
+            path, snapshot.generation, snapshot.metageneration, body, exc
+        ) from exc
+
+    async def _update_metadata(
+        self, path, transform, max_attempts=5, generation=None
+    ):
+        """Optimistically update object metadata via read-modify-PATCH.
+
+        Each attempt fetches a fresh, cache-bypassing object resource and
+        passes a read-only :class:`ObjectMetadataSnapshot` to the synchronous
+        ``transform`` callable. The returned update dict is validated and
+        reduced to a minimal PATCH body, which is published with both
+        ``ifGenerationMatch`` and ``ifMetagenerationMatch`` preconditions. On
+        a concurrent metadata change (HTTP 412, same generation) the latest
+        resource is re-read and ``transform`` is invoked again on that new
+        snapshot; the previous patch is never applied to stale state.
+
+        ``transform`` contract:
+
+        - Must be a synchronous, pure callable: one snapshot in, one update
+          dict out. Async functions and functions returning awaitables are
+          rejected, and side effects are unsupported because the callable may
+          be executed more than once when concurrent updates are retried.
+        - The snapshot must be treated as read-only.
+        - Return a dict mapping update keys to values. Any key that is not a
+          fixed field is treated as a custom metadata key. Fixed fields are
+          the snake_case names in :data:`SUPPORTED_FIXED_KEY_METADATA`:
+          ``content_encoding``, ``cache_control``, ``content_disposition``,
+          ``content_language`` and ``custom_time``.
+        - A key missing from the dict is left unchanged; ``None`` deletes the
+          key/field; an empty string is an ordinary value and sets the key to
+          ``""`` (it neither deletes nor no-ops). Values must be strings or
+          ``None``.
+        - Unknown, immutable or camelCase GCS fields (e.g. ``generation``,
+          ``md5Hash``, ``contentEncoding``) are rejected client-side before
+          any request is sent.
+        - If ``transform`` raises, returns an illegal value or the attempt
+          budget is exhausted, the exception propagates and no unconditional
+          write is ever attempted: every PATCH remains conditional.
+
+        Object identity and pinned generations:
+
+        - If the object generation changes between the snapshot and the PATCH
+          (same-name overwrite/recreation), :class:`ObjectReplaced` is raised;
+          a coincidentally equal metageneration is never treated as the same
+          object. By default the live generation is followed.
+        - Passing ``generation`` explicitly, or a version-aware path such as
+          ``"bucket/key#123"``, pins the update to that generation only; a
+          replaced live object results in :class:`ObjectReplaced` rather than
+          an update to the replacement.
+
+        Lost responses are handled without re-invoking ``transform``: a
+        verification GET proves either that the PATCH committed, that it did
+        not commit (the identical conditional body is then sent once), or that
+        the outcome cannot be determined, in which case
+        :class:`MetadataUpdateOutcomeUnknown` carries the in-flight patch for
+        out-of-band verification. Updates the server already accepted are not
+        rolled back.
+
+        Requester-pays billing (``userProject``) is applied automatically
+        when the filesystem was created with ``requester_pays=True``. On
+        success only the resource returned by GCS is used to refresh the
+        directory cache; the cache never participates in precondition
+        decisions.
+
+        Parameters
+        ----------
+        path: str
+            Object path, optionally including a ``#generation`` fragment.
+        transform: callable
+            ``transform(snapshot: ObjectMetadataSnapshot) -> dict``. May be
+            called multiple times; must be synchronous and side-effect free.
+        max_attempts: int
+            Maximum number of transform/PATCH attempts, >= 1. Retries only
+            happen after a 412 caused by a same-generation metadata change.
+        generation: str or int, optional
+            Pin the update to this object generation. Equivalent to the
+            ``#generation`` path fragment.
+
+        Returns
+        -------
+        dict
+            The processed object resource after the update (or the freshly
+            read resource when ``transform`` requests no changes).
+
+        Raises
+        ------
+        ObjectReplaced
+            The object generation no longer matches the snapshot.
+        MetagenerationMismatchError
+            Concurrent metadata writers exhausted ``max_attempts``.
+        MetadataUpdateOutcomeUnknown
+            A PATCH response was lost and the commit could not be verified.
+        TypeError, ValueError
+            Invalid ``transform`` output or arguments; raised before any
+            PATCH is sent.
+        """
+        if not callable(transform):
+            raise TypeError("transform must be a callable")
+        if asyncio.iscoroutinefunction(transform):
+            raise TypeError(
+                "transform must be a synchronous, pure function; async "
+                "callables are not accepted because transform may be retried"
+            )
+        if isinstance(max_attempts, bool) or int(max_attempts) < 1:
+            raise ValueError("max_attempts must be a positive integer")
+        max_attempts = int(max_attempts)
+
+        bucket, key, path_generation = self.split_path(path)
+        if not key:
+            raise FileNotFoundError(path)
+        pinned_generation = _coalesce_generation(generation, path_generation)
+        if pinned_generation is not None:
+            pinned_generation = str(pinned_generation)
+        # Fragment-free canonical path: conflict classification and lost
+        # response verification must always read the live object even when
+        # the caller pinned a generation via a "#generation" path fragment.
+        object_path = f"{bucket}/{key}"
+
+        resource = await self._fetch_object_resource(object_path, pinned_generation)
+        attempts = 0
+        while True:
+            attempts += 1
+            snapshot = _build_metadata_snapshot(object_path, resource)
+
+            try:
+                updates = transform(snapshot)
+            except Exception:
+                # Caller code failed before any write; propagate unchanged.
+                raise
+            if asyncio.iscoroutine(updates) or hasattr(updates, "__await__"):
+                if asyncio.iscoroutine(updates):
+                    updates.close()
+                raise TypeError(
+                    "metadata transform returned an awaitable; it must compute "
+                    "and return the update dict synchronously"
+                )
+            _validate_metadata_updates(updates)
+            body = _build_metadata_patch(snapshot, updates)
+            if not body:
+                # No effective change: avoid the PATCH entirely, return fresh
+                # deterministic state.
+                return self._store_metadata_result(object_path, resource)
+
+            try:
+                response = await self._call(
+                    "PATCH",
+                    "b/{}/o/{}",
+                    bucket,
+                    key,
+                    json=body,
+                    json_out=True,
+                    ifGenerationMatch=snapshot.generation,
+                    ifMetagenerationMatch=snapshot.metageneration,
+                )
+            except FileExistsError as exc:
+                # 412: a precondition failed. Classify on a fresh live read
+                # before retrying; the old patch is never replayed as-is.
+                resource = await self._handle_metadata_conflict(
+                    object_path,
+                    snapshot,
+                    attempts,
+                    max_attempts,
+                    pinned_generation,
+                    exc,
+                )
+                continue
+            except _METADATA_PATCH_LOST_RESPONSE_ERRORS as exc:
+                return await self._resolve_lost_metadata_response(
+                    object_path, bucket, key, snapshot, body, exc
+                )
+
+            return self._store_metadata_result(object_path, response)
+
+    update_metadata = asyn.sync_wrapper(_update_metadata)
 
     async def _merge(self, path, paths, acl=None):
         """Concatenate objects within a single bucket"""
@@ -3041,6 +3374,201 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
             prefetcher.close()
             cache._prefetcher = None
         super().close()
+
+
+# Transport-level failures raised after a metadata PATCH was dispatched but
+# before any response could be read. A received 4xx/5xx (HttpError) is a
+# definitive server answer and is deliberately not part of this tuple.
+_METADATA_PATCH_LOST_RESPONSE_ERRORS = (
+    aiohttp.ClientError,
+    asyncio.TimeoutError,
+    ChecksumError,
+)
+# A re-send after a verified non-commit additionally treats a fresh 412 as
+# terminal uncertainty instead of looping.
+_METADATA_PATCH_RESEND_ERRORS = (
+    FileExistsError,
+    aiohttp.ClientError,
+    asyncio.TimeoutError,
+    ChecksumError,
+)
+
+# Top-level object resource fields the update_metadata transform must not use
+# as update keys: server-managed identity/integrity fields, fields exposed
+# through other APIs, and camelCase aliases of the supported fixed fields
+# (the transform uses the snake_case names instead).
+_METADATA_UPDATE_REJECTED_FIELDS = frozenset(
+    {
+        "id",
+        "kind",
+        "selfLink",
+        "name",
+        "bucket",
+        "generation",
+        "metageneration",
+        "etag",
+        "size",
+        "md5Hash",
+        "crc32c",
+        "mediaLink",
+        "timeCreated",
+        "updated",
+        "storageClass",
+        "owner",
+        "acl",
+        "componentCount",
+        "customerEncryption",
+        "eventBasedHold",
+        "temporaryHold",
+        "retention",
+        "retentionExpireTime",
+        "kmsKeyName",
+        "timeStorageClassUpdated",
+        "metadata",
+        # contentType is mutable but only exposed via setxattrs(content_type=...)
+        "contentType",
+        "content_type",
+        # camelCase aliases of SUPPORTED_FIXED_KEY_METADATA
+        "contentEncoding",
+        "cacheControl",
+        "contentDisposition",
+        "contentLanguage",
+        "customTime",
+    }
+)
+
+
+@dataclass(frozen=True)
+class ObjectMetadataSnapshot:
+    """Read-only snapshot of the object metadata a transform is computed from.
+
+    Instances are passed to the ``transform`` callable of
+    :meth:`GCSFileSystem.update_metadata`. The same callable may receive
+    several snapshots when concurrent metadata changes force retries, so it
+    must be synchronous and pure and must not mutate the snapshot.
+    """
+
+    path: str
+    generation: str
+    metageneration: str
+    metadata: Mapping[str, str]
+    content_encoding: Optional[str]
+    cache_control: Optional[str]
+    content_disposition: Optional[str]
+    content_language: Optional[str]
+    custom_time: Optional[str]
+
+
+def _build_metadata_snapshot(path, resource):
+    """Build a frozen snapshot from a raw GCS object resource."""
+    generation = resource.get("generation")
+    metageneration = resource.get("metageneration")
+    if not generation or not metageneration:
+        raise ValueError(
+            f"Cannot update metadata of {path}: the object resource is missing "
+            "generation/metageneration, so optimistic preconditions cannot be built"
+        )
+    return ObjectMetadataSnapshot(
+        path=path,
+        generation=str(generation),
+        metageneration=str(metageneration),
+        metadata=MappingProxyType(dict(resource.get("metadata") or {})),
+        content_encoding=resource.get("contentEncoding"),
+        cache_control=resource.get("cacheControl"),
+        content_disposition=resource.get("contentDisposition"),
+        content_language=resource.get("contentLanguage"),
+        custom_time=resource.get("customTime"),
+    )
+
+
+def _validate_metadata_updates(updates):
+    """Reject illegal transform output client-side, before any PATCH."""
+    if not isinstance(updates, dict):
+        raise TypeError(
+            "metadata transform must return a dict of updates, got "
+            f"{type(updates).__name__}"
+        )
+    supported = ", ".join(sorted(SUPPORTED_FIXED_KEY_METADATA))
+    for key, value in updates.items():
+        if not isinstance(key, str) or not key:
+            raise ValueError(
+                f"metadata update keys must be non-empty strings, got {key!r}"
+            )
+        if key in _METADATA_UPDATE_REJECTED_FIELDS:
+            if key in SUPPORTED_FIXED_KEY_METADATA.values():
+                snake_name = next(
+                    name
+                    for name, google_name in SUPPORTED_FIXED_KEY_METADATA.items()
+                    if google_name == key
+                )
+                raise ValueError(
+                    f"metadata field {key!r} is not a valid update key; use the "
+                    f"snake_case name {snake_name!r} instead"
+                )
+            raise ValueError(
+                f"metadata field {key!r} is immutable or not supported by "
+                f"update_metadata; supported fixed fields are: {supported}"
+            )
+        if value is not None and not isinstance(value, str):
+            raise TypeError(
+                f"metadata value for {key!r} must be a string or None (None "
+                f"deletes the key, an empty string sets it to ''), got "
+                f"{type(value).__name__}"
+            )
+
+
+def _build_metadata_patch(snapshot, updates):
+    """Reduce validated updates to a minimal GCS PATCH body.
+
+    Missing keys are left untouched, ``None`` deletes (serialized as JSON
+    null) and empty strings are sent as values. Keys already matching the
+    snapshot are dropped, so unrelated concurrent metadata is preserved and
+    the request stays minimal.
+    """
+    metadata_patch = {}
+    fixed_patch = {}
+    for key, value in updates.items():
+        if key in SUPPORTED_FIXED_KEY_METADATA:
+            current = getattr(snapshot, key)
+            if value == current:
+                # None on an absent field, or an identical value: no-op.
+                continue
+            fixed_patch[SUPPORTED_FIXED_KEY_METADATA[key]] = value
+            continue
+
+        present = key in snapshot.metadata
+        if value is None and not present:
+            # Deleting a custom key that does not exist: nothing to send.
+            continue
+        if present and snapshot.metadata[key] == value:
+            continue
+        metadata_patch[key] = value
+
+    body = {}
+    if metadata_patch:
+        body["metadata"] = metadata_patch
+    body.update(fixed_patch)
+    return body
+
+
+def _metadata_patch_reflected(resource, body):
+    """Whether the live resource already reflects every change in ``body``."""
+    live_metadata = resource.get("metadata") or {}
+    for key, value in (body.get("metadata") or {}).items():
+        if value is None:
+            if key in live_metadata:
+                return False
+        elif live_metadata.get(key) != value:
+            return False
+    for google_name, value in body.items():
+        if google_name == "metadata":
+            continue
+        if value is None:
+            if resource.get(google_name) is not None:
+                return False
+        elif resource.get(google_name) != value:
+            return False
+    return True
 
 
 def _convert_fixed_key_metadata(metadata, *, from_google=False):

@@ -20,6 +20,7 @@ API
    GCSFileSystem.rm
    GCSFileSystem.tail
    GCSFileSystem.touch
+   GCSFileSystem.update_metadata
    GCSFileSystem.get_mapper
 
 .. autosummary::

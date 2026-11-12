@@ -1,12 +1,14 @@
 import asyncio
 import base64
 import builtins
+import copy
 import io
 import json
 import os
 import ssl
 import uuid
 from builtins import FileNotFoundError
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from itertools import chain
 from unittest import mock
@@ -26,9 +28,15 @@ import gcsfs.checkers
 import gcsfs.tests.settings
 from gcsfs import GCSFileSystem
 from gcsfs import __version__ as version
-from gcsfs.core import GCSFile
+from gcsfs.core import GCSFile, ObjectMetadataSnapshot
 from gcsfs.credentials import GoogleCredentials
-from gcsfs.retry import GenerationMismatchError, HttpError
+from gcsfs.retry import (
+    GenerationMismatchError,
+    HttpError,
+    MetadataUpdateOutcomeUnknown,
+    MetagenerationMismatchError,
+    ObjectReplaced,
+)
 from gcsfs.tests.conftest import (
     a,
     allfiles,
@@ -4692,3 +4700,781 @@ def test_get_dirs_and_update_cache_with_directories_and_prefix(gcs):
     assert f"{bucket}/a/b/c" in dirs
     # Cache should remain empty because update_cache=False and prefix is used
     assert len(gcs.dircache) == 0
+
+
+# ---------------------------------------------------------------------------
+# GCSFileSystem.update_metadata: optimistic read-modify-PATCH metadata CAS.
+# Only GCSFileSystem._call is mocked, so no emulator or docker is required.
+# ---------------------------------------------------------------------------
+
+_METADATA_TEST_PATH = f"{TEST_BUCKET}/metadata/cas-object"
+_METADATA_TEST_PARENT = f"{TEST_BUCKET}/metadata"
+
+
+def _make_metadata_resource(
+    generation="100", metageneration="1", metadata=None, **fixed_fields
+):
+    resource = {
+        "kind": "storage#object",
+        "id": f"{TEST_BUCKET}/metadata/cas-object/{generation}",
+        "bucket": TEST_BUCKET,
+        "name": "metadata/cas-object",
+        "generation": generation,
+        "metageneration": metageneration,
+        "size": "5",
+        "md5Hash": "dummyHash==",
+        "timeCreated": "2024-01-01T00:00:00.000Z",
+        "updated": "2024-01-01T00:00:00.000Z",
+        "storageClass": "STANDARD",
+    }
+    if metadata is not None:
+        resource["metadata"] = copy.deepcopy(metadata)
+    resource.update(fixed_fields)
+    return resource
+
+
+class _FakeMetadataServer:
+    """In-memory objects.get / objects.patch emulation with CAS preconditions."""
+
+    def __init__(self, resource):
+        self.live = copy.deepcopy(resource)
+        self.versions = {resource["generation"]: copy.deepcopy(resource)}
+        self.calls = []
+        # Scripted resources returned by the next GETs (models a stale read).
+        self.scripted_gets = []
+        # Exceptions raised by the next PATCHes (models a lost response).
+        self.patch_faults = []
+        # Hook invoked before every PATCH precondition check (models a
+        # concurrent writer committing between the client's GET and PATCH).
+        self.before_patch = None
+        self.deleted = False
+
+    async def __call__(self, method, path, *args, **kwargs):
+        self.calls.append((method, copy.deepcopy(args), copy.deepcopy(kwargs)))
+        if method == "GET":
+            if self.scripted_gets:
+                return copy.deepcopy(self.scripted_gets.pop(0))
+            generation = kwargs.get("generation")
+            if generation is not None:
+                if generation not in self.versions:
+                    raise FileNotFoundError(_METADATA_TEST_PATH)
+                return copy.deepcopy(self.versions[generation])
+            if self.deleted:
+                raise FileNotFoundError(_METADATA_TEST_PATH)
+            return copy.deepcopy(self.live)
+
+        if method == "PATCH":
+            if self.before_patch is not None:
+                self.before_patch(self, kwargs)
+            if self.patch_faults:
+                raise self.patch_faults.pop(0)
+            if kwargs.get("ifGenerationMatch") != self.live["generation"]:
+                raise FileExistsError(_METADATA_TEST_PATH)
+            if kwargs.get("ifMetagenerationMatch") != self.live["metageneration"]:
+                raise FileExistsError(_METADATA_TEST_PATH)
+
+            body = kwargs["json"]
+            if "metadata" in body:
+                meta = dict(self.live.get("metadata") or {})
+                for key, value in body["metadata"].items():
+                    if value is None:
+                        meta.pop(key, None)
+                    else:
+                        meta[key] = value
+                self.live["metadata"] = meta
+            for key, value in body.items():
+                if key == "metadata":
+                    continue
+                if value is None:
+                    self.live.pop(key, None)
+                else:
+                    self.live[key] = value
+            self.live["metageneration"] = str(int(self.live["metageneration"]) + 1)
+            self.versions[self.live["generation"]] = copy.deepcopy(self.live)
+            return copy.deepcopy(self.live)
+
+        raise AssertionError(f"unexpected call: {method} {path}")
+
+    def external_metadata_commit(self, **metadata):
+        """Another writer commits metadata on the same object generation."""
+        meta = dict(self.live.get("metadata") or {})
+        meta.update(metadata)
+        self.live["metadata"] = meta
+        self.live["metageneration"] = str(int(self.live["metageneration"]) + 1)
+        self.versions[self.live["generation"]] = copy.deepcopy(self.live)
+
+    def rebuild_same_name(self, metadata=None):
+        """Same-name object replacement: new generation, metageneration resets."""
+        new = _make_metadata_resource(
+            generation=str(int(self.live["generation"]) + 100),
+            metageneration="1",
+            metadata=metadata if metadata is not None else {},
+        )
+        self.live = copy.deepcopy(new)
+        self.versions[new["generation"]] = copy.deepcopy(new)
+
+    @property
+    def get_calls(self):
+        return [call for call in self.calls if call[0] == "GET"]
+
+    @property
+    def patch_calls(self):
+        return [call for call in self.calls if call[0] == "PATCH"]
+
+    @property
+    def patch_bodies(self):
+        return [call[2]["json"] for call in self.patch_calls]
+
+
+class _RecordingCounterTransform:
+    """Synchronous pure transform that increments a string counter."""
+
+    def __init__(self):
+        self.calls = 0
+        self.snapshots = []
+
+    def __call__(self, snapshot):
+        self.calls += 1
+        self.snapshots.append(snapshot)
+        current = int(snapshot.metadata.get("counter", "0"))
+        return {"counter": str(current + 1)}
+
+
+def _metadata_fs(**kwargs):
+    return GCSFileSystem(token="anon", skip_instance_cache=True, **kwargs)
+
+
+@contextmanager
+def _patched_metadata_transport(fs, fake):
+    # The fake is an async callable instance; patch _call directly so awaiting
+    # fs._call(...) runs its __call__ (AsyncMock would not await the returned
+    # coroutine because the instance is not itself a coroutine function).
+    with mock.patch.object(fs, "_call", new=fake):
+        yield fake
+
+
+def test_update_metadata_happy_path_sends_both_preconditions():
+    fs = _metadata_fs()
+    fake = _FakeMetadataServer(_make_metadata_resource(metadata={"counter": "0"}))
+    transform = _RecordingCounterTransform()
+
+    with _patched_metadata_transport(fs, fake):
+        result = fs.update_metadata(_METADATA_TEST_PATH, transform, max_attempts=3)
+
+    assert transform.calls == 1
+    assert result["metadata"]["counter"] == "1"
+    assert result["generation"] == "100"
+    assert result["metageneration"] == "2"
+    assert len(fake.get_calls) == 1 and len(fake.patch_calls) == 1
+    patch_kwargs = fake.patch_calls[0][2]
+    assert patch_kwargs["ifGenerationMatch"] == "100"
+    assert patch_kwargs["ifMetagenerationMatch"] == "1"
+    assert fake.patch_bodies == [{"metadata": {"counter": "1"}}]
+
+
+def test_update_metadata_two_clients_counter_cas_recomputes_patch():
+    """Two clients racing on a counter: the loser retries on the new state."""
+    fake = _FakeMetadataServer(_make_metadata_resource(metadata={"counter": "0"}))
+    fs1, fs2 = _metadata_fs(), _metadata_fs()
+    # A stale dircache entry must never feed the CAS preconditions.
+    stale_entry = fs2._process_object(
+        TEST_BUCKET, _make_metadata_resource(generation="999", metageneration="999")
+    )
+    fs2.dircache[_METADATA_TEST_PARENT] = [stale_entry]
+
+    with (
+        _patched_metadata_transport(fs1, fake),
+        _patched_metadata_transport(fs2, fake),
+    ):
+        first = _RecordingCounterTransform()
+        result1 = fs1.update_metadata(_METADATA_TEST_PATH, first, max_attempts=3)
+        assert result1["metadata"]["counter"] == "1"
+
+        # fs2 read the initial (counter=0, mg=1) state before fs1 committed.
+        fake.scripted_gets.append(_make_metadata_resource(metadata={"counter": "0"}))
+        second = _RecordingCounterTransform()
+        result2 = fs2.update_metadata(_METADATA_TEST_PATH, second, max_attempts=3)
+
+    assert result2["metadata"]["counter"] == "2"
+    assert first.calls == 1 and second.calls == 2
+    # The stale first patch is not replayed: the second attempt recomputes "2".
+    assert fake.patch_bodies == [
+        {"metadata": {"counter": "1"}},
+        {"metadata": {"counter": "1"}},
+        {"metadata": {"counter": "2"}},
+    ]
+    # Every PATCH is conditional on both generations, using fresh (not cached) values.
+    assert [call[2]["ifGenerationMatch"] for call in fake.patch_calls] == [
+        "100",
+        "100",
+        "100",
+    ]
+    assert [call[2]["ifMetagenerationMatch"] for call in fake.patch_calls] == [
+        "1",
+        "1",
+        "2",
+    ]
+    # fs2: one stale scripted GET + one conflict-classification GET.
+    assert len(fake.get_calls) == 3
+    cached = fs2.dircache[_METADATA_TEST_PARENT][0]
+    assert cached["metageneration"] == "3"
+    assert cached["metadata"]["counter"] == "2"
+
+
+def test_update_metadata_preserves_unrelated_concurrent_metadata():
+    fs = _metadata_fs()
+    fake = _FakeMetadataServer(
+        _make_metadata_resource(metadata={"counter": "0", "tag": "a"})
+    )
+    fired = {"once": False}
+
+    def concurrent_writer(server, kwargs):
+        if not fired["once"]:
+            fired["once"] = True
+            server.external_metadata_commit(tag="b")
+
+    fake.before_patch = concurrent_writer
+    transform = _RecordingCounterTransform()
+
+    with _patched_metadata_transport(fs, fake):
+        result = fs.update_metadata(_METADATA_TEST_PATH, transform, max_attempts=3)
+
+    assert result["metadata"] == {"counter": "1", "tag": "b"}
+    assert transform.calls == 2
+    # The client only ever sends its own key; the unrelated key is preserved.
+    assert fake.patch_bodies == [
+        {"metadata": {"counter": "1"}},
+        {"metadata": {"counter": "1"}},
+    ]
+    assert fake.patch_calls[1][2]["ifMetagenerationMatch"] == "2"
+
+
+def test_update_metadata_same_name_rebuild_raises_object_replaced():
+    fs = _metadata_fs()
+    fake = _FakeMetadataServer(_make_metadata_resource(metadata={"counter": "0"}))
+    fake.before_patch = lambda server, kwargs: server.rebuild_same_name(
+        metadata={"counter": "99"}
+    )
+    transform = _RecordingCounterTransform()
+
+    with _patched_metadata_transport(fs, fake):
+        with pytest.raises(ObjectReplaced) as excinfo:
+            fs.update_metadata(_METADATA_TEST_PATH, transform, max_attempts=3)
+
+    error = excinfo.value
+    assert error.expected_generation == "100"
+    assert error.actual_generation == "200"
+    # The replacement happens to reuse metageneration "1"; generation still wins.
+    assert fake.live["metageneration"] == "1"
+    assert transform.calls == 1
+    # No unconditional PATCH and no PATCH against the new generation.
+    assert len(fake.patch_calls) == 1
+    assert fake.patch_calls[0][2]["ifGenerationMatch"] == "100"
+    assert fake.patch_calls[0][2]["ifMetagenerationMatch"] == "1"
+    # The replacement object is left untouched.
+    assert fake.live["metadata"] == {"counter": "99"}
+    assert _METADATA_TEST_PARENT not in fs.dircache
+
+
+@pytest.mark.parametrize("use_fragment", [False, True])
+def test_update_metadata_pinned_generation_never_follows_replacement(use_fragment):
+    fs = _metadata_fs()
+    if use_fragment:
+        fs.version_aware = True
+    fake = _FakeMetadataServer(_make_metadata_resource(metadata={"counter": "0"}))
+    fake.before_patch = lambda server, kwargs: server.rebuild_same_name()
+    target = (
+        f"{_METADATA_TEST_PATH}#100"
+        if use_fragment
+        else _METADATA_TEST_PATH
+    )
+
+    with _patched_metadata_transport(fs, fake):
+        with pytest.raises(ObjectReplaced):
+            fs.update_metadata(
+                target,
+                _RecordingCounterTransform(),
+                max_attempts=3,
+                generation=None if use_fragment else "100",
+            )
+
+    # The snapshot read is pinned to the requested generation.
+    assert fake.get_calls[0][2].get("generation") == "100"
+    # Conflict classification reads the live object unpinned.
+    assert fake.get_calls[-1][2].get("generation") is None
+    # Every PATCH targets the pinned generation only, never the replacement.
+    assert all(
+        call[2]["ifGenerationMatch"] == "100" for call in fake.patch_calls
+    )
+
+
+def test_update_metadata_pinned_generation_happy_path():
+    fs = _metadata_fs()
+    fake = _FakeMetadataServer(
+        _make_metadata_resource(
+            generation="100", metageneration="1", metadata={"counter": "0"}
+        )
+    )
+    with _patched_metadata_transport(fs, fake):
+        result = fs.update_metadata(
+            _METADATA_TEST_PATH,
+            _RecordingCounterTransform(),
+            max_attempts=2,
+            generation="100",
+        )
+    assert fake.get_calls[0][2].get("generation") == "100"
+    assert fake.patch_calls[0][2]["ifGenerationMatch"] == "100"
+    assert result["metadata"]["counter"] == "1"
+
+
+def test_update_metadata_metageneration_race_budget_maps_to_mismatch_error():
+    fs = _metadata_fs()
+    fake = _FakeMetadataServer(_make_metadata_resource(metadata={"counter": "0"}))
+    # Another writer advances metageneration before every client PATCH.
+    fake.before_patch = lambda server, kwargs: server.external_metadata_commit(
+        other=str(server.live["metageneration"])
+    )
+    transform = _RecordingCounterTransform()
+
+    with _patched_metadata_transport(fs, fake):
+        with pytest.raises(MetagenerationMismatchError) as excinfo:
+            fs.update_metadata(_METADATA_TEST_PATH, transform, max_attempts=3)
+
+    assert excinfo.value.attempts == 3
+    assert excinfo.value.metageneration == "4"
+    assert transform.calls == 3
+    assert len(fake.patch_calls) == 3
+    # All PATCHes stayed conditional: preconditions match each attempt's snapshot.
+    assert [call[2]["ifMetagenerationMatch"] for call in fake.patch_calls] == [
+        "1",
+        "2",
+        "3",
+    ]
+    assert all(
+        call[2]["ifGenerationMatch"] == "100" for call in fake.patch_calls
+    )
+    # Initial GET plus one classification GET per failed PATCH.
+    assert len(fake.get_calls) == 4
+
+
+def test_update_metadata_lost_response_resends_same_body_when_uncommitted():
+    fs = _metadata_fs()
+    fake = _FakeMetadataServer(_make_metadata_resource(metadata={"counter": "0"}))
+    fake.patch_faults = [aiohttp.ClientConnectionError("response lost")]
+    transform = _RecordingCounterTransform()
+
+    with _patched_metadata_transport(fs, fake):
+        result = fs.update_metadata(_METADATA_TEST_PATH, transform, max_attempts=3)
+
+    assert result["metadata"]["counter"] == "1"
+    # The transform is never re-run; the identical conditional body is resent.
+    assert transform.calls == 1
+    assert len(fake.patch_calls) == 2
+    first, second = fake.patch_calls
+    assert first[2]["json"] == second[2]["json"] == {"metadata": {"counter": "1"}}
+    assert first[2]["ifMetagenerationMatch"] == "1"
+    assert second[2]["ifMetagenerationMatch"] == "1"
+    # A verification GET sits between the failed PATCH and the resend.
+    assert [call[0] for call in fake.calls] == ["GET", "PATCH", "GET", "PATCH"]
+
+
+def test_update_metadata_lost_response_uncertain_when_resend_also_lost():
+    fs = _metadata_fs()
+    fake = _FakeMetadataServer(_make_metadata_resource(metadata={"counter": "0"}))
+    fake.patch_faults = [
+        aiohttp.ClientConnectionError("lost once"),
+        aiohttp.ClientConnectionError("lost twice"),
+    ]
+    transform = _RecordingCounterTransform()
+
+    with _patched_metadata_transport(fs, fake):
+        with pytest.raises(MetadataUpdateOutcomeUnknown) as excinfo:
+            fs.update_metadata(_METADATA_TEST_PATH, transform, max_attempts=3)
+
+    assert transform.calls == 1
+    assert excinfo.value.generation == "100"
+    assert excinfo.value.metageneration == "1"
+    assert excinfo.value.updates == {"metadata": {"counter": "1"}}
+    assert isinstance(excinfo.value.last_error, aiohttp.ClientConnectionError)
+    assert _METADATA_TEST_PARENT not in fs.dircache
+
+
+def test_update_metadata_lost_response_verified_commit_needs_no_resend():
+    fs = _metadata_fs()
+    fake = _FakeMetadataServer(_make_metadata_resource(metadata={"counter": "0"}))
+    fake.patch_faults = [aiohttp.ClientConnectionError("response lost")]
+
+    def transform(snapshot):
+        # The lost PATCH had this body; simulate the server accepting it below.
+        return {"counter": "1"}
+
+    def server_applied_it(server, kwargs):
+        if not getattr(server, "_committed", False):
+            server._committed = True
+            server.external_metadata_commit(counter="1")
+
+    fake.before_patch = server_applied_it
+
+    with _patched_metadata_transport(fs, fake):
+        result = fs.update_metadata(_METADATA_TEST_PATH, transform, max_attempts=3)
+
+    assert result["metadata"]["counter"] == "1"
+    # One PATCH only: the verification GET proves the commit landed.
+    assert len(fake.patch_calls) == 1
+    assert [call[0] for call in fake.calls] == ["GET", "PATCH", "GET"]
+    assert result["metageneration"] == "2"
+
+
+def test_update_metadata_lost_response_uncertain_when_state_diverged():
+    fs = _metadata_fs()
+    fake = _FakeMetadataServer(_make_metadata_resource(metadata={"counter": "0"}))
+    fake.patch_faults = [aiohttp.ClientConnectionError("response lost")]
+
+    def another_writer_won(server, kwargs):
+        if not getattr(server, "_diverged", False):
+            server._diverged = True
+            server.external_metadata_commit(counter="42")
+
+    fake.before_patch = another_writer_won
+
+    with _patched_metadata_transport(fs, fake):
+        with pytest.raises(MetadataUpdateOutcomeUnknown) as excinfo:
+            fs.update_metadata(
+                _METADATA_TEST_PATH,
+                lambda snapshot: {"counter": "1"},
+                max_attempts=3,
+            )
+
+    # Metageneration advanced but our intended value is not present.
+    assert excinfo.value.updates == {"metadata": {"counter": "1"}}
+    assert len(fake.patch_calls) == 1
+    assert fake.live["metadata"]["counter"] == "42"
+    assert _METADATA_TEST_PARENT not in fs.dircache
+
+
+@pytest.mark.parametrize(
+    "post_loss_mutation",
+    ["replaced", "deleted"],
+)
+def test_update_metadata_lost_response_uncertain_after_identity_change(
+    post_loss_mutation,
+):
+    fs = _metadata_fs()
+    fake = _FakeMetadataServer(_make_metadata_resource(metadata={"counter": "0"}))
+    fake.patch_faults = [aiohttp.ClientConnectionError("response lost")]
+
+    def mutate(server, kwargs):
+        if not getattr(server, "_mutated", False):
+            server._mutated = True
+            if post_loss_mutation == "replaced":
+                server.rebuild_same_name(metadata={"counter": "1"})
+            else:
+                server.deleted = True
+
+    fake.before_patch = mutate
+
+    with _patched_metadata_transport(fs, fake):
+        with pytest.raises(MetadataUpdateOutcomeUnknown):
+            fs.update_metadata(
+                _METADATA_TEST_PATH,
+                lambda snapshot: {"counter": "1"},
+                max_attempts=3,
+            )
+    assert len(fake.patch_calls) == 1
+
+
+def test_update_metadata_lost_response_uncertain_when_resend_gets_412():
+    fs = _metadata_fs()
+    fake = _FakeMetadataServer(_make_metadata_resource(metadata={"counter": "0"}))
+    # First PATCH loses its response; verification proves no commit, but a
+    # writer sneaks in before the resend, so the conditional resend gets 412.
+    fake.patch_faults = [
+        aiohttp.ClientConnectionError("lost"),
+        FileExistsError(_METADATA_TEST_PATH),
+    ]
+
+    with _patched_metadata_transport(fs, fake):
+        with pytest.raises(MetadataUpdateOutcomeUnknown) as excinfo:
+            fs.update_metadata(
+                _METADATA_TEST_PATH,
+                lambda snapshot: {"counter": "1"},
+                max_attempts=3,
+            )
+
+    assert isinstance(excinfo.value.last_error, aiohttp.ClientConnectionError)
+    # transform ran once; no transform re-run, no unconditional write.
+    assert len(fake.patch_calls) == 2
+    assert all(
+        call[2]["ifMetagenerationMatch"] == "1" for call in fake.patch_calls
+    )
+
+
+def test_update_metadata_pinned_generation_deleted_object_raises_replaced():
+    fs = _metadata_fs()
+    fake = _FakeMetadataServer(_make_metadata_resource(metadata={"counter": "0"}))
+    # PATCH loses the precondition race (412); by the classification GET the
+    # live object has been deleted, while the pinned version remains readable.
+    fake.patch_faults = [FileExistsError(_METADATA_TEST_PATH)]
+    fake.deleted = True
+
+    with _patched_metadata_transport(fs, fake):
+        with pytest.raises(ObjectReplaced) as excinfo:
+            fs.update_metadata(
+                _METADATA_TEST_PATH,
+                _RecordingCounterTransform(),
+                max_attempts=2,
+                generation="100",
+            )
+
+    assert excinfo.value.expected_generation == "100"
+    assert excinfo.value.actual_generation is None
+    assert fake.patch_calls[0][2]["ifGenerationMatch"] == "100"
+
+
+def test_update_metadata_transform_error_and_illegal_output_send_no_patch():
+    fs = _metadata_fs()
+
+    def raising_transform(snapshot):
+        raise ValueError("boom")
+
+    fake = _FakeMetadataServer(_make_metadata_resource(metadata={"counter": "0"}))
+    with _patched_metadata_transport(fs, fake):
+        with pytest.raises(ValueError, match="boom"):
+            fs.update_metadata(_METADATA_TEST_PATH, raising_transform)
+        assert len(fake.get_calls) == 1 and fake.patch_calls == []
+
+        with pytest.raises(TypeError):
+            fs.update_metadata(
+                _METADATA_TEST_PATH, lambda snapshot: ["not", "a", "dict"]
+            )
+        assert fake.patch_calls == []
+
+        with pytest.raises(TypeError):
+            fs.update_metadata(_METADATA_TEST_PATH, 123)
+        # A non-callable is rejected before any network I/O.
+        assert len(fake.get_calls) == 2
+
+    async def async_transform(snapshot):
+        return {"counter": "1"}
+
+    fake2 = _FakeMetadataServer(_make_metadata_resource(metadata={"counter": "0"}))
+    with _patched_metadata_transport(fs, fake2):
+        with pytest.raises(TypeError):
+            fs.update_metadata(_METADATA_TEST_PATH, async_transform)
+        assert fake2.get_calls == []
+
+        def returns_coroutine(snapshot):
+            return async_transform(snapshot)
+
+        with pytest.raises(TypeError):
+            fs.update_metadata(_METADATA_TEST_PATH, returns_coroutine)
+        assert fake2.patch_calls == []
+
+
+@pytest.mark.parametrize(
+    "bad_key",
+    [
+        "generation",
+        "metageneration",
+        "md5Hash",
+        "etag",
+        "metadata",
+        "content_type",
+        "contentEncoding",
+        "cacheControl",
+        "contentDisposition",
+        "contentLanguage",
+        "customTime",
+    ],
+)
+def test_update_metadata_rejects_unknown_immutable_camelcase_fields(bad_key):
+    fs = _metadata_fs()
+    fake = _FakeMetadataServer(_make_metadata_resource(metadata={}))
+    with _patched_metadata_transport(fs, fake):
+        with pytest.raises(ValueError):
+            fs.update_metadata(
+                _METADATA_TEST_PATH, lambda snapshot: {bad_key: "x"}
+            )
+    assert fake.patch_calls == []
+
+
+@pytest.mark.parametrize("bad_value", [1, 1.5, ["x"], {"k": "v"}, True])
+def test_update_metadata_rejects_non_string_values(bad_value):
+    fs = _metadata_fs()
+    fake = _FakeMetadataServer(
+        _make_metadata_resource(metadata={"counter": "0"})
+    )
+    with _patched_metadata_transport(fs, fake):
+        with pytest.raises(TypeError):
+            fs.update_metadata(
+                _METADATA_TEST_PATH, lambda snapshot: {"counter": bad_value}
+            )
+        with pytest.raises(ValueError):
+            fs.update_metadata(
+                _METADATA_TEST_PATH, lambda snapshot: {1: "x"}
+            )
+    assert fake.patch_calls == []
+
+
+def test_update_metadata_none_missing_empty_string_and_fixed_fields():
+    fs = _metadata_fs()
+    fake = _FakeMetadataServer(
+        _make_metadata_resource(
+            metadata={"keep": "v", "blank": "x"},
+            contentEncoding="gzip",
+        )
+    )
+    captured = []
+
+    def transform(snapshot):
+        captured.append(snapshot)
+        return {
+            "keep": None,  # delete existing custom key
+            "absent": None,  # delete missing custom key: no-op
+            "blank": "",  # empty string is a real value, not a delete
+            "content_encoding": None,  # clear a present fixed field
+            "cache_control": "no-cache",  # set a fixed field
+        }
+
+    with _patched_metadata_transport(fs, fake):
+        result = fs.update_metadata(_METADATA_TEST_PATH, transform, max_attempts=2)
+
+    snapshot = captured[0]
+    assert snapshot.content_encoding == "gzip"
+    assert snapshot.cache_control is None
+    assert snapshot.metadata["keep"] == "v"
+    # Minimal body: missing key dropped, nulls and empty string distinguished.
+    assert fake.patch_bodies == [
+        {
+            "metadata": {"keep": None, "blank": ""},
+            "contentEncoding": None,
+            "cacheControl": "no-cache",
+        }
+    ]
+    assert result["metadata"] == {"blank": ""}
+    assert "contentEncoding" not in result
+    assert result["cacheControl"] == "no-cache"
+
+
+def test_update_metadata_noop_transform_skips_patch():
+    fs = _metadata_fs()
+    fake = _FakeMetadataServer(
+        _make_metadata_resource(
+            metadata={"counter": "0", "keep": "v"},
+            cacheControl="no-cache",
+        )
+    )
+
+    def noop(snapshot):
+        return {
+            "counter": "0",  # identical
+            "never_set": None,  # None on missing
+            "cache_control": "no-cache",  # identical fixed field
+        }
+
+    fs.dircache[_METADATA_TEST_PARENT] = [
+        fs._process_object(TEST_BUCKET, _make_metadata_resource())
+    ]
+    with _patched_metadata_transport(fs, fake):
+        result = fs.update_metadata(_METADATA_TEST_PATH, noop, max_attempts=2)
+
+    assert fake.patch_calls == []
+    assert len(fake.get_calls) == 1
+    assert result["metadata"]["counter"] == "0"
+    # The fresh deterministic resource still refreshes a cached parent listing.
+    assert fs.dircache[_METADATA_TEST_PARENT][0]["metageneration"] == "1"
+
+
+def test_update_metadata_dircache_bypassed_and_refreshed_from_response_only():
+    fs = _metadata_fs()
+    fake = _FakeMetadataServer(_make_metadata_resource(metadata={"counter": "0"}))
+    stale = fs._process_object(
+        TEST_BUCKET,
+        _make_metadata_resource(
+            generation="999", metageneration="999", metadata={"counter": "stale"}
+        ),
+    )
+    fs.dircache[_METADATA_TEST_PARENT] = [stale]
+
+    with _patched_metadata_transport(fs, fake):
+        result = fs.update_metadata(
+            _METADATA_TEST_PATH, _RecordingCounterTransform()
+        )
+
+    # A GET was issued despite the cached entry, and PATCH used fresh generations.
+    assert fake.get_calls[0][2].get("generation") is None
+    assert fake.patch_calls[0][2]["ifGenerationMatch"] == "100"
+    assert fake.patch_calls[0][2]["ifMetagenerationMatch"] == "1"
+    cached = fs.dircache[_METADATA_TEST_PARENT]
+    assert len(cached) == 1
+    assert cached[0] is result
+    assert cached[0]["generation"] == "100"
+    assert cached[0]["metageneration"] == "2"
+    assert cached[0]["metadata"]["counter"] == "1"
+
+
+def test_update_metadata_requester_pays_flows_through_call_chain():
+    fs = _metadata_fs(requester_pays=True, project=TEST_PROJECT)
+    # userProject is attached to every request at the _request/_get_params layer.
+    assert fs._get_params({})["userProject"] == TEST_PROJECT
+    fake = _FakeMetadataServer(_make_metadata_resource(metadata={"counter": "0"}))
+
+    with _patched_metadata_transport(fs, fake):
+        fs.update_metadata(_METADATA_TEST_PATH, _RecordingCounterTransform())
+
+    assert [call[0] for call in fake.calls] == ["GET", "PATCH"]
+    assert fake.patch_calls[0][2]["ifGenerationMatch"] == "100"
+
+
+@pytest.mark.asyncio
+async def test_update_metadata_async_entry_and_read_only_snapshot():
+    fs = _metadata_fs()
+    fake = _FakeMetadataServer(
+        _make_metadata_resource(
+            metadata={"counter": "0"}, contentEncoding="gzip"
+        )
+    )
+    captured = []
+
+    def transform(snapshot):
+        captured.append(snapshot)
+        return {"counter": "1", "content_encoding": None}
+
+    with _patched_metadata_transport(fs, fake):
+        result = await fs._update_metadata(
+            _METADATA_TEST_PATH, transform, max_attempts=2
+        )
+
+    assert result["metadata"]["counter"] == "1"
+    snapshot = captured[0]
+    assert isinstance(snapshot, ObjectMetadataSnapshot)
+    assert snapshot.generation == "100"
+    assert snapshot.metageneration == "1"
+    assert snapshot.content_encoding == "gzip"
+    # The snapshot is read-only in both the mapping and its dataclass fields.
+    with pytest.raises(TypeError):
+        snapshot.metadata["new"] = "x"
+    with pytest.raises(AttributeError):
+        snapshot.generation = "200"
+    assert fake.patch_bodies == [
+        {"metadata": {"counter": "1"}, "contentEncoding": None}
+    ]
+
+
+def test_update_metadata_validates_arguments_before_io():
+    fs = _metadata_fs()
+    fake = _FakeMetadataServer(_make_metadata_resource(metadata={}))
+    with _patched_metadata_transport(fs, fake):
+        with pytest.raises(ValueError):
+            fs.update_metadata(
+                _METADATA_TEST_PATH, lambda snapshot: {}, max_attempts=0
+            )
+        with pytest.raises(ValueError):
+            fs.update_metadata(
+                _METADATA_TEST_PATH, lambda snapshot: {}, max_attempts=True
+            )
+        with pytest.raises(FileNotFoundError):
+            fs.update_metadata(
+                TEST_BUCKET, lambda snapshot: {}, max_attempts=1
+            )
+    assert fake.calls == []

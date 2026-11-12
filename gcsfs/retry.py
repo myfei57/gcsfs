@@ -66,6 +66,96 @@ class GenerationMismatchError(OSError):
         return GenerationMismatchError, (self.path, self.generation)
 
 
+class ObjectReplaced(OSError):
+    """Raised by an optimistic metadata update when the object at ``path`` is no
+    longer the same generation as the snapshot the transform was computed from.
+
+    A same-name object was overwritten or recreated (possibly with a
+    ``metageneration`` that happens to match the old one); object identity is
+    therefore established from ``generation``, never from ``metageneration``
+    alone. No update is applied to the replacement object.
+    """
+
+    def __init__(self, path, expected_generation, actual_generation):
+        super().__init__(
+            f"{path}: object generation changed from {expected_generation} to "
+            f"{actual_generation}; the metadata update was not applied to the "
+            "replacement object"
+        )
+        self.path = path
+        self.expected_generation = expected_generation
+        self.actual_generation = actual_generation
+
+    def __reduce__(self):
+        """This makes the Exception pickleable."""
+        return ObjectReplaced, (
+            self.path,
+            self.expected_generation,
+            self.actual_generation,
+        )
+
+
+class MetagenerationMismatchError(OSError):
+    """Raised when a conditional metadata update keeps losing the
+    ``ifMetagenerationMatch`` precondition race until ``max_attempts`` is spent.
+
+    Every PATCH carried preconditions, so no unconditional write was ever sent.
+    """
+
+    def __init__(self, path, metageneration, attempts):
+        super().__init__(
+            f"{path}: metadata changed concurrently (last observed metageneration "
+            f"{metageneration}) and the update did not converge within {attempts} "
+            "attempt(s)"
+        )
+        self.path = path
+        self.metageneration = metageneration
+        self.attempts = attempts
+
+    def __reduce__(self):
+        """This makes the Exception pickleable."""
+        return MetagenerationMismatchError, (
+            self.path,
+            self.metageneration,
+            self.attempts,
+        )
+
+
+class MetadataUpdateOutcomeUnknown(OSError):
+    """Raised when a conditional metadata PATCH was dispatched but its response
+    was lost (transport-level failure) and follow-up verification cannot prove
+    whether the server applied it.
+
+    The transform is never re-run in this situation, because it may be
+    non-idempotent (e.g. appending or incrementing). The exception carries the
+    precondition generations and the exact minimal patch that was in flight so
+    the caller can verify the outcome out of band. Updates the server already
+    accepted are not rolled back.
+    """
+
+    def __init__(self, path, generation, metageneration, updates, last_error):
+        super().__init__(
+            f"{path}: metadata PATCH response was lost and commit could not be "
+            f"verified (generation={generation}, metageneration={metageneration}); "
+            f"intended patch: {updates}"
+        )
+        self.path = path
+        self.generation = generation
+        self.metageneration = metageneration
+        self.updates = updates
+        self.last_error = last_error
+
+    def __reduce__(self):
+        """This makes the Exception pickleable."""
+        return MetadataUpdateOutcomeUnknown, (
+            self.path,
+            self.generation,
+            self.metageneration,
+            self.updates,
+            self.last_error,
+        )
+
+
 class NonRetryableError(Exception):
     """Raised when the underlying error can not be retried, or continued further."""
 

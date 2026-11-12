@@ -11,6 +11,9 @@ from gcsfs.retry import (
     DEFAULT_RETRY_CONFIG,
     GenerationMismatchError,
     HttpError,
+    MetadataUpdateOutcomeUnknown,
+    MetagenerationMismatchError,
+    ObjectReplaced,
     get_storage_control_retry_config,
     is_retriable,
     validate_response,
@@ -152,6 +155,37 @@ def test_generation_mismatch_error_pickle():
     assert actual.args == expected.args
     assert actual.path == "bucket/key"
     assert actual.generation == 7
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ObjectReplaced("bucket/key", "100", "200"),
+        MetagenerationMismatchError("bucket/key", "4", 3),
+        MetadataUpdateOutcomeUnknown(
+            "bucket/key", "100", "1", {"metadata": {"k": "v"}}, RuntimeError("lost")
+        ),
+    ],
+)
+def test_metadata_update_errors_pickle_and_attributes(error):
+    actual = pickle.loads(pickle.dumps(error))
+
+    assert type(actual) is type(error)
+    assert actual.args == error.args
+    for attr in ("path",):
+        assert getattr(actual, attr) == getattr(error, attr)
+
+    if isinstance(error, ObjectReplaced):
+        assert actual.expected_generation == "100"
+        assert actual.actual_generation == "200"
+    elif isinstance(error, MetagenerationMismatchError):
+        assert actual.metageneration == "4"
+        assert actual.attempts == 3
+    else:
+        assert actual.generation == "100"
+        assert actual.metageneration == "1"
+        assert actual.updates == {"metadata": {"k": "v"}}
+        assert isinstance(actual.last_error, RuntimeError)
 
 
 def conditional_exception(process_id):
