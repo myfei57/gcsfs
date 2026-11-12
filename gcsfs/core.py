@@ -26,6 +26,7 @@ from urllib.parse import urlsplit
 
 import aiohttp
 import fsspec
+import requests
 from fsspec import asyn
 from fsspec.callbacks import NoOpCallback
 from fsspec.implementations.http import get_client
@@ -103,6 +104,40 @@ _VALID_LIST_PARAMS = {
     "pageToken",
     "includeFoldersAsPrefixes",
 }
+
+# Query parameters accepted by the soft-deleted objects list API. The
+# soft-delete listing is kept separate from ``_VALID_LIST_PARAMS``:
+# ``softDeleted=true`` is mutually exclusive with ``versions=true`` and must
+# never leak into the live/versions listing path.
+_VALID_SOFT_DELETED_LIST_PARAMS = {
+    "delimiter",
+    "prefix",
+    "startOffset",
+    "endOffset",
+    "maxResults",
+    "pageToken",
+    "matchGlob",
+    "projection",
+    "softDeleted",
+}
+
+# Default bound on concurrent restore POSTs in the batch API.
+DEFAULT_SOFT_DELETE_RESTORE_CONCURRENCY = 8
+
+# Transport-level failures where no HTTP response was observed. For the
+# non-idempotent restore POST these mean the outcome is unknown rather than a
+# definitive failure, so they must never be retried blindly. Defined at module
+# scope (and not inside methods that take a ``requests`` parameter, which
+# would shadow the ``requests`` package).
+_UNCERTAIN_RESTORE_EXCEPTIONS = (
+    aiohttp.ClientError,
+    asyncio.TimeoutError,
+    requests.exceptions.RequestException,
+)
+
+# Sentinel distinguishing "argument not supplied" from an explicit value such
+# as ``if_generation_match=0``.
+_UNSET = object()
 
 
 def quote(s):
@@ -301,6 +336,57 @@ def _build_user_agent(cache_type=None, cache_source=None):
     return " ".join(tokens)
 
 
+class SoftDeleteError(OSError):
+    """Base class for errors raised by the soft-delete listing/restore APIs."""
+
+
+class SoftDeleteNotEnabledError(SoftDeleteError):
+    """Raised when the target bucket has no soft delete policy.
+
+    The JSON API answers with ``400 Bad Request``: reason
+    ``SoftDeletePolicyRequired`` on restore and ``invalidArgument`` on
+    ``softDeleted=true`` listings.
+    """
+
+
+class SoftDeletedObjectNotFoundError(SoftDeleteError, FileNotFoundError):
+    """Raised when the soft-deleted object cannot be found (HTTP 404).
+
+    The retention duration may have elapsed (the object was hard deleted),
+    the name/generation may not match any stored object, or the supplied
+    ``restoreToken`` may be wrong. Subclasses ``FileNotFoundError`` so callers
+    handling ordinary missing-object paths keep working.
+    """
+
+
+class RestoreTokenRequiredError(SoftDeleteError):
+    """Raised when name and generation match several soft-deleted instances.
+
+    This is possible in hierarchical namespace buckets. The caller must
+    disambiguate with the ``restoreToken`` value returned by
+    :meth:`GCSFileSystem.list_soft_deleted`.
+    """
+
+
+class RestorePreconditionFailedError(SoftDeleteError):
+    """Raised when a restore precondition is not satisfied (HTTP 412).
+
+    Either the live object's generation does not match ``ifGenerationMatch``,
+    or the targeted object is live/noncurrent rather than soft-deleted
+    (server reason ``objectNotSoftDeleted``).
+    """
+
+
+class RestoreResultUncertainError(SoftDeleteError):
+    """Raised when the restore response was lost before it could be observed.
+
+    The non-idempotent restore POST may already have created a new live
+    object, so it must not be retried blindly (a retry could create a second
+    copy). Re-list the live and soft-deleted namespaces to determine the
+    actual outcome before deciding what to do.
+    """
+
+
 class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
     r"""
     Connect to Google Cloud Storage.
@@ -488,6 +574,12 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         self._use_mtls_endpoint = self._use_client_cert and _use_mtls_endpoint()
         self._ssl_context_task = None
 
+        # Soft-deleted object listings are cached separately from
+        # ``self.dircache``. Normal ls/info/open only consult ``dircache`` and
+        # live object GETs, so a soft-deleted object can never be mistaken for
+        # a live file. Keyed like ``dircache`` (stripped "bucket/key" paths).
+        self._soft_delete_cache = {}
+
         if check_connection:
             warnings.warn(
                 "The `check_connection` argument is deprecated and will be removed in a future release.",
@@ -662,6 +754,42 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         cache_source=None,
         **kwargs,
     ):
+        # Retryable path used by idempotent reads/deletes. Non-idempotent
+        # operations that must not be re-issued blindly (object restore) call
+        # ``_request_once`` directly so a lost response is reported as
+        # uncertain instead of being retried into a duplicate operation.
+        return await self._request_once(
+            method,
+            path,
+            *args,
+            headers=headers,
+            json=json,
+            data=data,
+            cache_type=cache_type,
+            cache_source=cache_source,
+            **kwargs,
+        )
+
+    async def _request_once(
+        self,
+        method,
+        path,
+        *args,
+        headers=None,
+        json=None,
+        data=None,
+        cache_type=None,
+        cache_source=None,
+        **kwargs,
+    ):
+        """Issue exactly one HTTP attempt, without any retry loop.
+
+        Transport-level failures (no response observed) propagate as the
+        underlying exception so callers running non-idempotent writes can
+        classify the outcome as uncertain. Responses with an HTTP status are
+        turned into the usual gcsfs exceptions by ``validate_response`` and
+        are therefore definitive.
+        """
         await self._set_session()
         if hasattr(data, "seek"):
             data.seek(0)
@@ -699,6 +827,25 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
             return headers, contents
 
     call = asyn.sync_wrapper(_call)
+
+    async def _call_once(
+        self, method, path, *args, json_out=False, info_out=False, **kwargs
+    ):
+        """Like :meth:`_call` but performs a single, non-retried attempt."""
+        logger.debug(
+            f"{method.upper()} (once): {path}, {args}, {kwargs.get('headers')}"
+        )
+        status, headers, info, contents = await self._request_once(
+            method, path, *args, **kwargs
+        )
+        if json_out:
+            return json.loads(contents)
+        elif info_out:
+            return info
+        else:
+            return headers, contents
+
+    call_once = asyn.sync_wrapper(_call_once)
 
     @property
     def buckets(self):
@@ -1088,9 +1235,550 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
             return buckets
         return self.dircache[""]
 
+    # ------------------------------------------------------------------
+    # Soft-deleted objects (list / restore)
+    #
+    # Soft-deleted objects use a dedicated GCS query parameter
+    # (``softDeleted=true``), a dedicated cache (``_soft_delete_cache``) and
+    # dedicated entry representation (``soft_deleted=True`` plus the
+    # ``restoreToken`` field). They are never written into ``dircache``, so
+    # ordinary ls/info/open paths cannot confuse them with live objects.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _soft_delete_error_reason(exc):
+        """Extract the GCS error ``reason`` from an :class:`HttpError` body."""
+        resp = getattr(exc, "_error_response", None)
+        if isinstance(resp, dict):
+            nested = resp.get("errors")
+            if isinstance(nested, list) and nested and isinstance(nested[0], dict):
+                return nested[0].get("reason") or ""
+            return resp.get("reason") or ""
+        return ""
+
+    @staticmethod
+    def _soft_delete_disabled_text(text):
+        """Whether an error message says the bucket has no soft delete policy."""
+        lowered = text.lower()
+        return (
+            "softdeletepolicyrequired" in lowered
+            or "soft delete policy" in lowered
+            or ("soft delete" in lowered and "not enabled" in lowered)
+        )
+
+    @staticmethod
+    def _restore_token_text(text):
+        """Whether an error message asks for a restoreToken."""
+        lowered = text.lower()
+        return "restoretoken" in lowered or "restore token" in lowered
+
+    async def _call_list_soft_deleted(self, bucket, **kwargs):
+        """Fetch a single page of soft-deleted objects.
+
+        Only parameters valid for the soft-delete listing are forwarded, so
+        live-listing parameters (e.g. ``versions``) can never pollute this
+        request.
+        """
+        valid_kwargs = {
+            k: v
+            for k, v in kwargs.items()
+            if k in _VALID_SOFT_DELETED_LIST_PARAMS and v is not None
+        }
+        try:
+            return await self._call(
+                "GET", "b/{}/o", bucket, json_out=True, **valid_kwargs
+            )
+        except HttpError as e:
+            reason = self._soft_delete_error_reason(e)
+            text = f"{reason} {e}"
+            if e.code == 400 and (
+                reason == "SoftDeletePolicyRequired"
+                or self._soft_delete_disabled_text(text)
+            ):
+                raise SoftDeleteNotEnabledError(
+                    f"Bucket {bucket!r} has no soft delete policy: {e}"
+                ) from e
+            raise
+        except ValueError as e:
+            # validate_response surfaces some 400 bodies (messages containing
+            # "invalid", e.g. reason invalidArgument) as ValueError.
+            if self._soft_delete_disabled_text(str(e)):
+                raise SoftDeleteNotEnabledError(
+                    f"Bucket {bucket!r} has no soft delete policy: {e}"
+                ) from e
+            raise
+
+    async def _list_soft_deleted(
+        self,
+        path,
+        prefix="",
+        *,
+        max_results=None,
+        page_size=1000,
+        delimiter=None,
+        start_offset=None,
+        end_offset=None,
+        match_glob=None,
+        projection=None,
+        refresh=False,
+    ):
+        """List soft-deleted objects under ``path`` using GCS pagination.
+
+        Performs ``GET b/{bucket}/o?softDeleted=true`` and follows
+        ``nextPageToken`` until the listing is exhausted or ``max_results``
+        is reached. Soft-deleted listings are cached separately from the
+        live/versions directory cache.
+
+        Parameters
+        ----------
+        path : str
+            ``bucket`` or ``bucket/key-prefix``. The key part is passed to
+            GCS verbatim -- trailing slashes are preserved, so a prefix such
+            as ``"folder/"`` never gets normalized into ``"folder"``.
+        prefix : str
+            Additional key prefix, appended to the key derived from ``path``
+            without any slash normalization.
+        max_results : int, optional
+            Stop after at most this many entries (objects plus delimiter
+            prefixes). A bounded listing is not cached.
+        page_size : int
+            ``maxResults`` value requested for each individual page.
+        delimiter : str, optional
+            GCS ``delimiter`` (typically ``"/"``). Truncated names come back
+            as directory-style entries.
+        start_offset, end_offset, match_glob, projection
+            Forwarded verbatim to the GCS list API.
+        refresh : bool
+            Drop any cached soft-deleted listing for this path first.
+
+        Returns
+        -------
+        list[dict]
+            Processed object entries, each tagged ``soft_deleted=True`` and
+            carrying the GCS soft-delete metadata (``softDeleteTime``,
+            ``hardDeleteTime`` and, when present, ``restoreToken``).
+        """
+        stripped = self._strip_protocol(path)
+        bucket, key, _ = self._split_path(stripped, version_aware=False)
+        if not bucket:
+            raise ValueError("A bucket is required to list soft-deleted objects")
+
+        # Cache key is the verbatim stripped path: "bucket/folder" and
+        # "bucket/folder/" denote different GCS prefixes and must not share a
+        # cache entry (no rstrip("/") normalization here).
+        cache_key = stripped
+        if refresh:
+            self._soft_delete_cache.pop(cache_key, None)
+        # Only complete, unfiltered listings are served from / written to
+        # the dedicated soft-delete cache.
+        cacheable = not prefix and max_results is None and delimiter is None
+        if cacheable and cache_key in self._soft_delete_cache:
+            return [dict(entry) for entry in self._soft_delete_cache[cache_key]]
+
+        # Use the real object key verbatim. No rstrip("/") and no implicit
+        # trailing slash: normalizing here would drop the distinction between
+        # e.g. "folder/" and "folder" and match keys the caller did not ask
+        # for.
+        real_prefix = f"{key}{prefix}" if prefix else key
+
+        entries = []
+        pseudo_dirs = []
+        page_token = None
+        remaining = max_results
+        while True:
+            page_max = page_size if remaining is None else min(page_size, remaining)
+            page = await self._call_list_soft_deleted(
+                bucket,
+                softDeleted="true",
+                prefix=real_prefix or None,
+                delimiter=delimiter,
+                pageToken=page_token,
+                maxResults=page_max,
+                startOffset=start_offset,
+                endOffset=end_offset,
+                matchGlob=match_glob,
+                projection=projection,
+            )
+            assert page["kind"] == "storage#objects"
+
+            for raw in page.get("items") or []:
+                # Defence in depth: GCS already filters by prefix, but check
+                # against the raw object key rather than the gcsfs
+                # "bucket/key" path so slash semantics cannot be altered by
+                # path normalization.
+                if real_prefix and not raw.get("name", "").startswith(real_prefix):
+                    continue
+                entry = self._process_object(bucket, raw)
+                entry["soft_deleted"] = True
+                entries.append(entry)
+
+            for truncated in page.get("prefixes") or []:
+                pseudo_dirs.append(
+                    {
+                        "bucket": bucket,
+                        "name": f"{bucket}/{truncated}",
+                        "size": 0,
+                        "storageClass": "DIRECTORY",
+                        "type": "directory",
+                        "soft_deleted": True,
+                    }
+                )
+
+            page_token = page.get("nextPageToken")
+            if page_token is None:
+                break
+            if max_results is not None:
+                remaining = max_results - len(entries) - len(pseudo_dirs)
+                if remaining <= 0:
+                    break
+
+        out = pseudo_dirs + entries
+        if cacheable:
+            self._soft_delete_cache[cache_key] = [dict(entry) for entry in out]
+        return out
+
+    list_soft_deleted = asyn.sync_wrapper(_list_soft_deleted)
+
+    def _find_soft_deleted_ambiguity(self, bucket, key, generation):
+        """Return cached soft-deleted entries sharing name+generation.
+
+        The server remains the authority; this only raises a client-side
+        error when the dedicated soft-delete cache already proves that a
+        ``restoreToken`` is required.
+        """
+        name = f"{bucket}/{key}"
+        matches = [
+            entry
+            for listing in self._soft_delete_cache.values()
+            for entry in listing
+            if entry.get("soft_deleted")
+            and entry.get("name") == name
+            and str(entry.get("generation")) == str(generation)
+        ]
+        return matches if len(matches) > 1 else []
+
+    async def _restore_soft_deleted(
+        self,
+        path,
+        generation=None,
+        *,
+        restore_token=None,
+        if_generation_match=_UNSET,
+        overwrite=False,
+        copy_source_acl=None,
+        projection=None,
+    ):
+        """Restore one soft-deleted object via ``POST .../restore``.
+
+        A restore always creates a *new* live object with a new generation;
+        the original soft-deleted generation is never reactivated and stays
+        governed by the server-side soft delete retention. This method
+        therefore returns the new object's identity and only touches the live
+        directory cache after a confirmed success response.
+
+        Overwrite strategy (applied to the *live* object of the same name):
+
+        - default (``if_generation_match`` unset, ``overwrite=False``): send
+          ``ifGenerationMatch=0``, so the restore fails when a live object
+          already exists;
+        - ``if_generation_match=N``: true compare-and-swap carried by the
+          POST itself (N=0 means "no live object"). There is deliberately no
+          HEAD-then-POST pattern;
+        - ``overwrite=True``: send no precondition, allowing an unconditional
+          overwrite. Combining it with an explicit ``if_generation_match``
+          raises ``ValueError`` before any request is made.
+
+        Parameters
+        ----------
+        path : str
+            ``bucket/key`` of the soft-deleted object (or a version-aware
+            path carrying a ``#generation`` fragment).
+        generation : int or str
+            Generation of the soft-deleted object to restore.
+        restore_token : str, optional
+            Required when name+generation match several soft-deleted
+            instances (HNS buckets).
+        copy_source_acl : bool, optional
+            Forwarded as ``copySourceAcl`` only when explicitly provided; the
+            server rejects it on uniform-access buckets.
+        projection : str, optional
+            Forwarded verbatim.
+
+        Raises
+        ------
+        SoftDeletedObjectNotFoundError
+            HTTP 404: hard deleted, retention expired, or wrong token/name/
+            generation. Not retried.
+        RestorePreconditionFailedError
+            HTTP 412: live generation mismatch or the object is not
+            soft-deleted.
+        RestoreTokenRequiredError
+            The server (or the local cache) requires a ``restoreToken``.
+        SoftDeleteNotEnabledError
+            The bucket has no soft delete policy.
+        RestoreResultUncertainError
+            The response was lost; the outcome is unknown and the request was
+            not retried.
+        """
+        stripped = self._strip_protocol(path)
+        bucket, key, _ = self._split_path(stripped, version_aware=False)
+        _, _, path_generation = self._split_path(stripped, version_aware=True)
+        if not key:
+            raise ValueError("An object key is required to restore an object")
+        if generation is None:
+            generation = path_generation
+        if generation is None:
+            raise ValueError("generation is required to restore a soft-deleted object")
+        try:
+            generation = str(int(str(generation)))
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"generation must be an integer-like value, got {generation!r}"
+            )
+
+        if overwrite and if_generation_match is not _UNSET:
+            raise ValueError(
+                "overwrite=True conflicts with an explicit if_generation_match; "
+                "choose exactly one overwrite strategy"
+            )
+        if if_generation_match is _UNSET:
+            # Safe default: require that no live object of this name exists.
+            # An unconditional overwrite must be opted into explicitly.
+            effective_match = None if overwrite else 0
+        else:
+            if isinstance(if_generation_match, bool) or int(if_generation_match) < 0:
+                raise ValueError(
+                    "if_generation_match must be a non-negative integer, got "
+                    f"{if_generation_match!r}"
+                )
+            effective_match = int(if_generation_match)
+
+        if copy_source_acl is not None and not isinstance(copy_source_acl, bool):
+            raise ValueError("copy_source_acl must be True, False or None")
+
+        if restore_token is None:
+            ambiguous = self._find_soft_deleted_ambiguity(bucket, key, generation)
+            if ambiguous:
+                raise RestoreTokenRequiredError(
+                    f"{stripped} generation {generation}: multiple soft-deleted "
+                    "instances share this name and generation; pass the "
+                    "restoreToken from list_soft_deleted to disambiguate"
+                )
+
+        params = {"generation": generation}
+        if restore_token is not None:
+            params["restoreToken"] = restore_token
+        if effective_match is not None:
+            params["ifGenerationMatch"] = str(effective_match)
+        if copy_source_acl is not None:
+            params["copySourceAcl"] = "true" if copy_source_acl else "false"
+        if projection is not None:
+            params["projection"] = projection
+
+        try:
+            # Single, non-retried attempt: a blind retry of this POST could
+            # create a second restored live object.
+            response = await self._call_once(
+                "POST",
+                "b/{}/o/{}/restore",
+                bucket,
+                key,
+                json_out=True,
+                **params,
+            )
+        except _UNCERTAIN_RESTORE_EXCEPTIONS as e:
+            raise RestoreResultUncertainError(
+                f"Restore of {stripped} generation {generation} may have "
+                f"succeeded, but the response was lost ({e!r}). Do not retry "
+                "blindly; re-list live and soft-deleted objects first."
+            ) from e
+        except FileNotFoundError as e:
+            raise SoftDeletedObjectNotFoundError(
+                f"{stripped} generation {generation}: soft-deleted object not "
+                "found (hard deleted, retention expired, or wrong "
+                "name/generation/restoreToken)"
+            ) from e
+        except FileExistsError as e:
+            raise RestorePreconditionFailedError(
+                f"{stripped} generation {generation}: restore precondition "
+                f"failed (ifGenerationMatch={effective_match!r}); the live "
+                "generation does not match or the object is not soft-deleted"
+            ) from e
+        except HttpError as e:
+            reason = self._soft_delete_error_reason(e)
+            text = f"{reason} {e}"
+            if e.code == 400:
+                if (
+                    reason == "SoftDeletePolicyRequired"
+                    or self._soft_delete_disabled_text(text)
+                ):
+                    raise SoftDeleteNotEnabledError(
+                        f"Bucket {bucket!r} has no soft delete policy: {e}"
+                    ) from e
+                if self._restore_token_text(text):
+                    raise RestoreTokenRequiredError(
+                        f"{stripped} generation {generation}: a restoreToken "
+                        "is required to disambiguate the soft-deleted instance"
+                    ) from e
+            raise
+        except ValueError as e:
+            # 400 bodies whose message contains "invalid" arrive as ValueError.
+            if self._soft_delete_disabled_text(str(e)):
+                raise SoftDeleteNotEnabledError(
+                    f"Bucket {bucket!r} has no soft delete policy: {e}"
+                ) from e
+            if self._restore_token_text(str(e)):
+                raise RestoreTokenRequiredError(
+                    f"{stripped} generation {generation}: a restoreToken is "
+                    "required to disambiguate the soft-deleted instance"
+                ) from e
+            raise
+
+        new_object = self._process_object(bucket, response)
+        if (
+            new_object.get("generation") is not None
+            and str(new_object["generation"]) == generation
+        ):
+            # The GCS contract promises a fresh generation here; warn rather
+            # than pretend the old generation was reactivated.
+            logger.warning(
+                "Restore of %s generation %s returned the same generation; "
+                "treating the response as a new live object per server reply",
+                stripped,
+                generation,
+            )
+        # Only the confirmed new live object updates the LIVE directory
+        # cache. The soft-delete cache is intentionally left alone: the
+        # lifecycle of the old soft-deleted record is server-side.
+        await self._write_file_cache_update(stripped)
+        return new_object
+
+    restore_soft_deleted = asyn.sync_wrapper(_restore_soft_deleted)
+
+    @staticmethod
+    def _normalize_restore_request(request):
+        """Normalize one batch item into a plain dict."""
+        if isinstance(request, dict):
+            item = dict(request)
+            req_path = item.pop("path", None)
+            req_generation = item.pop("generation", None)
+            restore_token = item.pop("restore_token", item.pop("restoreToken", None))
+            if req_path is None or req_generation is None:
+                raise ValueError(
+                    "each restore request must include 'path' and 'generation'"
+                )
+            per_item_options = item
+        elif isinstance(request, (tuple, list)):
+            if len(request) not in (2, 3):
+                raise ValueError(
+                    "tuple requests must be (path, generation) or "
+                    "(path, generation, restore_token)"
+                )
+            req_path, req_generation = request[0], request[1]
+            restore_token = request[2] if len(request) == 3 else None
+            per_item_options = {}
+        else:
+            raise TypeError(
+                "restore requests must be dicts or (path, generation) tuples"
+            )
+        return {
+            "path": req_path,
+            "generation": req_generation,
+            "restore_token": restore_token,
+            "options": per_item_options,
+        }
+
+    async def _restore_soft_deleted_batch(
+        self,
+        requests,
+        *,
+        concurrency=DEFAULT_SOFT_DELETE_RESTORE_CONCURRENCY,
+        **restore_options,
+    ):
+        """Restore many soft-deleted objects with bounded concurrency.
+
+        Each item is restored with a single non-retried POST. Results are
+        returned per item in input order -- partial success is never rolled
+        back and never reported as whole-batch success. A lost response is
+        recorded as ``"uncertain"`` rather than retried, avoiding duplicate
+        restored copies.
+
+        Parameters
+        ----------
+        requests : iterable
+            Dicts with ``path``/``generation`` (and optional
+            ``restore_token`` plus any per-item restore keyword option), or
+            ``(path, generation)`` /
+            ``(path, generation, restore_token)`` tuples.
+        concurrency : int
+            Maximum number of restore requests in flight.
+
+        Returns
+        -------
+        list[dict]
+            One result dict per input item: ``status`` is ``"success"`` (with
+            ``object``), ``"error"`` (definitive failure) or ``"uncertain"``
+            (response lost). Error/uncertain items include ``error`` text and
+            the original ``exception``.
+        """
+        if not isinstance(concurrency, int) or concurrency < 1:
+            raise ValueError("concurrency must be a positive integer")
+        items = [self._normalize_restore_request(req) for req in requests]
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def _restore_one(item):
+            options = {**restore_options, **item["options"]}
+            async with semaphore:
+                try:
+                    new_object = await self._restore_soft_deleted(
+                        item["path"],
+                        item["generation"],
+                        restore_token=item["restore_token"],
+                        **options,
+                    )
+                except RestoreResultUncertainError as e:
+                    uncertain = e
+                except _UNCERTAIN_RESTORE_EXCEPTIONS as e:
+                    # Defence in depth if the single-item mapping is bypassed:
+                    # a lost response is uncertain, never a blind failure to
+                    # retry.
+                    uncertain = RestoreResultUncertainError(
+                        f"Restore of {item['path']} generation "
+                        f"{item['generation']} has an unknown outcome: {e!r}"
+                    )
+                except Exception as e:
+                    return {
+                        "path": item["path"],
+                        "generation": str(item["generation"]),
+                        "status": "error",
+                        "error": str(e),
+                        "exception": e,
+                    }
+                else:
+                    return {
+                        "path": item["path"],
+                        "generation": str(item["generation"]),
+                        "status": "success",
+                        "object": new_object,
+                    }
+                return {
+                    "path": item["path"],
+                    "generation": str(item["generation"]),
+                    "status": "uncertain",
+                    "error": str(uncertain),
+                    "exception": uncertain,
+                }
+
+        return await asyncio.gather(*[_restore_one(item) for item in items])
+
+    restore_soft_deleted_batch = asyn.sync_wrapper(_restore_soft_deleted_batch)
+
     def invalidate_cache(self, path=None):
         """
         Invalidate listing cache for given path, it is reloaded on next use.
+
+        Both the live/versions directory cache (``dircache``) and the
+        separate soft-deleted listing cache are affected.
 
         Parameters
         ----------
@@ -1101,10 +1789,20 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         if path is None:
             logger.debug("invalidate_cache clearing cache")
             self.dircache.clear()
+            self._soft_delete_cache.clear()
         else:
             path = self._strip_protocol(path).rstrip("/")
             if not path:
                 self.dircache.pop("", None)
+                # Soft-delete keys are verbatim prefixes (they may end in
+                # "/"), so drop every key at or under the bucket root.
+                for key in list(self._soft_delete_cache):
+                    self._soft_delete_cache.pop(key, None)
+            else:
+                # Verbatim soft-delete keys may keep a trailing slash.
+                for key in list(self._soft_delete_cache):
+                    if key == path or key.startswith(path + "/"):
+                        self._soft_delete_cache.pop(key, None)
             while path:
                 self.dircache.pop(path, None)
                 path = self._parent(path)
