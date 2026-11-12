@@ -1960,6 +1960,59 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
 
             await self._write_file_cache_update(rpath)
 
+    async def _resumable_upload_file(
+        self,
+        lpath,
+        rpath,
+        checkpoint_path,
+        metadata=None,
+        content_type=None,
+        fixed_key_metadata=None,
+        mode="overwrite",
+        if_generation_match=None,
+        kms_key_name=None,
+        chunksize=50 * 2**20,
+        max_attempts=6,
+    ):
+        """Checkpoint-backed resumable upload; see ``gcsfs.resumable``."""
+        from .resumable import resumable_upload_file
+
+        result = await resumable_upload_file(
+            self,
+            lpath,
+            rpath,
+            checkpoint_path,
+            metadata=metadata,
+            content_type=content_type,
+            fixed_key_metadata=fixed_key_metadata,
+            mode=mode,
+            if_generation_match=if_generation_match,
+            kms_key_name=kms_key_name,
+            chunksize=chunksize,
+            max_attempts=max_attempts,
+        )
+        if result["state"] == "complete":
+            await self._write_file_cache_update(rpath)
+        return result
+
+    resumable_upload_file = asyn.sync_wrapper(_resumable_upload_file)
+
+    async def _resumable_upload_status(self, checkpoint_path):
+        """Return the server-confirmed state of a checkpointed resumable upload."""
+        from .resumable import resumable_upload_status
+
+        return await resumable_upload_status(self, checkpoint_path)
+
+    resumable_upload_status = asyn.sync_wrapper(_resumable_upload_status)
+
+    async def _cancel_resumable_upload(self, checkpoint_path, *, abandon):
+        """Retain or abandon a checkpointed resumable upload session."""
+        from .resumable import cancel_resumable_upload
+
+        return await cancel_resumable_upload(self, checkpoint_path, abandon=abandon)
+
+    cancel_resumable_upload = asyn.sync_wrapper(_cancel_resumable_upload)
+
     async def _isdir(self, path):
 
         try:
